@@ -172,141 +172,158 @@ fn db_error_response(err: &rusqlite::Error) -> Response<Cursor<Vec<u8>>> {
     error_response(status, &message)
 }
 
-// --- Minimal JSON -----------------------------------------------------------
+// --- Minimal hand-rolled JSON -------------------------------------------
 //
-// No JSON crate is in Cargo.toml yet, and the shapes here are flat
-// string/number/null fields on a single object, so a tiny hand-rolled
-// reader/writer beats pulling in serde for this.
+// Request/response bodies in this API are small, flat, fixed-shape objects
+// (a handful of string/int fields, or a list of such objects) — not
+// arbitrary JSON. A generic parser/serializer (or a serde dependency) would
+// be more code and more risk than reading the couple of fields each
+// endpoint actually needs. See /ponytail posture in CLAUDE.md.
 
-#[derive(Debug, PartialEq)]
-enum JsonValue {
-    Str(String),
-    Num(i64),
-    Null,
+/// Extracts a top-level `"key": "value"` string field from a flat JSON
+/// object. No nesting, no unicode escapes — just enough for this API's
+/// request bodies.
+fn json_str_field(body: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let after_key = &body[body.find(&needle)? + needle.len()..];
+    let after_colon = after_key[after_key.find(':')? + 1..].trim_start();
+    let rest = after_colon.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(rest[..end].replace("\\\"", "\"").replace("\\\\", "\\"))
 }
 
-/// Parses a flat `{"key": "str" | 123 | null, ...}` object. No nesting, no
-/// arrays, no floats — nothing here needs them.
-fn parse_json_object(body: &str) -> Result<Vec<(String, JsonValue)>, String> {
-    let mut chars = body.trim().chars().peekable();
-    let err = || "invalid JSON body".to_string();
-
-    if chars.next() != Some('{') {
-        return Err(err());
-    }
-
-    let mut fields = Vec::new();
-    loop {
-        while chars.peek() == Some(&' ') || chars.peek() == Some(&'\n') || chars.peek() == Some(&'\t') || chars.peek() == Some(&'\r') {
-            chars.next();
-        }
-        if chars.peek() == Some(&'}') {
-            chars.next();
-            break;
-        }
-        let key = parse_json_string(&mut chars).ok_or_else(err)?;
-        while matches!(chars.peek(), Some(' ') | Some('\n') | Some('\t') | Some('\r')) {
-            chars.next();
-        }
-        if chars.next() != Some(':') {
-            return Err(err());
-        }
-        while matches!(chars.peek(), Some(' ') | Some('\n') | Some('\t') | Some('\r')) {
-            chars.next();
-        }
-        let value = if chars.peek() == Some(&'"') {
-            JsonValue::Str(parse_json_string(&mut chars).ok_or_else(err)?)
-        } else {
-            let mut token = String::new();
-            while let Some(&c) = chars.peek() {
-                if c == ',' || c == '}' {
-                    break;
-                }
-                token.push(c);
-                chars.next();
-            }
-            let token = token.trim();
-            if token == "null" {
-                JsonValue::Null
-            } else {
-                JsonValue::Num(token.parse::<i64>().map_err(|_| err())?)
-            }
-        };
-        fields.push((key, value));
-        while matches!(chars.peek(), Some(' ') | Some('\n') | Some('\t') | Some('\r')) {
-            chars.next();
-        }
-        match chars.next() {
-            Some(',') => continue,
-            Some('}') => break,
-            _ => return Err(err()),
-        }
-    }
-    Ok(fields)
+/// Extracts a top-level `"key": <integer>` field from a flat JSON object.
+fn json_int_field(body: &str, key: &str) -> Option<i64> {
+    let needle = format!("\"{key}\"");
+    let after_key = &body[body.find(&needle)? + needle.len()..];
+    let after_colon = after_key[after_key.find(':')? + 1..].trim_start();
+    let end = after_colon
+        .find(|c: char| !(c.is_ascii_digit() || c == '-'))
+        .unwrap_or(after_colon.len());
+    after_colon[..end].parse().ok()
 }
 
-fn parse_json_string(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<String> {
-    if chars.next() != Some('"') {
-        return None;
-    }
-    let mut s = String::new();
-    loop {
-        match chars.next()? {
-            '"' => return Some(s),
-            '\\' => match chars.next()? {
-                '"' => s.push('"'),
-                '\\' => s.push('\\'),
-                other => s.push(other),
-            },
-            c => s.push(c),
-        }
+fn json_string(s: &str) -> String {
+    format!("\"{}\"", json_escape(s))
+}
+
+// --- Currencies ---------------------------------------------------------
+
+fn currency_json(row: &rusqlite::Row) -> rusqlite::Result<String> {
+    let id: i64 = row.get(0)?;
+    let code: String = row.get(1)?;
+    let minor_unit: i64 = row.get(2)?;
+    Ok(format!(
+        r#"{{"id": {id}, "code": {}, "minor_unit": {minor_unit}}}"#,
+        json_string(&code)
+    ))
+}
+
+fn create_currency(conn: &Connection, body: &str) -> Response<Cursor<Vec<u8>>> {
+    let (Some(code), Some(minor_unit)) =
+        (json_str_field(body, "code"), json_int_field(body, "minor_unit"))
+    else {
+        return error_response(400, "expected {code, minor_unit}");
+    };
+    match conn.query_row(
+        "INSERT INTO currencies (code, minor_unit) VALUES (?1, ?2) RETURNING id, code, minor_unit",
+        rusqlite::params![code, minor_unit],
+        currency_json,
+    ) {
+        Ok(json) => json_response(201, json),
+        Err(err) => db_error_response(&err),
     }
 }
 
-fn get_str<'a>(fields: &'a [(String, JsonValue)], key: &str) -> Option<&'a str> {
-    fields.iter().find(|(k, _)| k == key).and_then(|(_, v)| match v {
-        JsonValue::Str(s) => Some(s.as_str()),
-        _ => None,
-    })
+fn list_currencies(conn: &Connection) -> Response<Cursor<Vec<u8>>> {
+    let mut stmt = conn
+        .prepare("SELECT id, code, minor_unit FROM currencies")
+        .expect("prepare list currencies");
+    let rows: Vec<String> = stmt
+        .query_map([], currency_json)
+        .expect("query currencies")
+        .map(|r| r.expect("read currency row"))
+        .collect();
+    json_response(200, format!("[{}]", rows.join(", ")))
 }
 
-fn get_i64_opt(fields: &[(String, JsonValue)], key: &str) -> Option<Option<i64>> {
-    fields.iter().find(|(k, _)| k == key).map(|(_, v)| match v {
-        JsonValue::Num(n) => Some(*n),
-        _ => None,
-    })
+// --- Categories -----------------------------------------------------------
+
+fn category_json(row: &rusqlite::Row) -> rusqlite::Result<String> {
+    let id: i64 = row.get(0)?;
+    let name: String = row.get(1)?;
+    Ok(format!(r#"{{"id": {id}, "name": {}}}"#, json_string(&name)))
+}
+
+fn create_category(conn: &Connection, body: &str) -> Response<Cursor<Vec<u8>>> {
+    let Some(name) = json_str_field(body, "name") else {
+        return error_response(400, "expected {name}");
+    };
+    match conn.query_row(
+        "INSERT INTO categories (name) VALUES (?1) RETURNING id, name",
+        [name],
+        category_json,
+    ) {
+        Ok(json) => json_response(201, json),
+        Err(err) => db_error_response(&err),
+    }
+}
+
+fn list_categories(conn: &Connection) -> Response<Cursor<Vec<u8>>> {
+    let mut stmt = conn
+        .prepare("SELECT id, name FROM categories")
+        .expect("prepare list categories");
+    let rows: Vec<String> = stmt
+        .query_map([], category_json)
+        .expect("query categories")
+        .map(|r| r.expect("read category row"))
+        .collect();
+    json_response(200, format!("[{}]", rows.join(", ")))
+}
+
+fn delete_category(conn: &Connection, id: &str) -> Response<Cursor<Vec<u8>>> {
+    let Ok(id) = id.parse::<i64>() else {
+        return not_found();
+    };
+    let deleted = conn
+        .execute("DELETE FROM categories WHERE id = ?1", [id])
+        .expect("delete category");
+    if deleted == 0 {
+        not_found()
+    } else {
+        Response::from_string("").with_status_code(204)
+    }
 }
 
 // --- Accounts handlers --------------------------------------------------
 
-fn account_json(id: i64, name: &str, r#type: &str, currency_id: Option<i64>) -> String {
-    format!(
-        r#"{{"id": {}, "name": "{}", "type": "{}", "currency_id": {}}}"#,
-        id,
-        json_escape(name),
-        json_escape(r#type),
+fn account_json(row: &rusqlite::Row) -> rusqlite::Result<String> {
+    let id: i64 = row.get(0)?;
+    let name: String = row.get(1)?;
+    let r#type: String = row.get(2)?;
+    let currency_id: Option<i64> = row.get(3)?;
+    Ok(format!(
+        r#"{{"id": {id}, "name": {}, "type": {}, "currency_id": {}}}"#,
+        json_string(&name),
+        json_string(&r#type),
         currency_id.map(|c| c.to_string()).unwrap_or_else(|| "null".to_string()),
-    )
+    ))
 }
 
 fn handle_create_account(conn: &Connection, body: &str) -> Response<Cursor<Vec<u8>>> {
-    let fields = match parse_json_object(body) {
-        Ok(f) => f,
-        Err(e) => return error_response(400, &e),
+    let (Some(name), Some(account_type)) =
+        (json_str_field(body, "name"), json_str_field(body, "type"))
+    else {
+        return error_response(400, "expected {name, type}");
     };
-    let (Some(name), Some(account_type)) = (get_str(&fields, "name"), get_str(&fields, "type")) else {
-        return error_response(400, "name and type are required");
-    };
-    let currency_id = get_i64_opt(&fields, "currency_id").unwrap_or(None);
+    let currency_id = json_int_field(body, "currency_id");
 
-    match conn.execute(
-        "INSERT INTO accounts (name, type, currency_id) VALUES (?1, ?2, ?3)",
+    match conn.query_row(
+        "INSERT INTO accounts (name, type, currency_id) VALUES (?1, ?2, ?3) RETURNING id, name, type, currency_id",
         rusqlite::params![name, account_type, currency_id],
+        account_json,
     ) {
-        Ok(_) => {
-            let id = conn.last_insert_rowid();
-            json_response(201, account_json(id, name, account_type, currency_id))
-        }
+        Ok(json) => json_response(201, json),
         Err(e) => db_error_response(&e),
     }
 }
@@ -315,18 +332,11 @@ fn handle_list_accounts(conn: &Connection) -> Response<Cursor<Vec<u8>>> {
     let mut stmt = conn
         .prepare("SELECT id, name, type, currency_id FROM accounts")
         .expect("failed to prepare accounts query");
-    let rows = stmt
-        .query_map([], |row| {
-            Ok(account_json(
-                row.get(0)?,
-                &row.get::<_, String>(1)?,
-                &row.get::<_, String>(2)?,
-                row.get(3)?,
-            ))
-        })
+    let rows: Vec<String> = stmt
+        .query_map([], account_json)
         .expect("failed to query accounts")
         .map(|r| r.expect("failed to read account row"))
-        .collect::<Vec<_>>();
+        .collect();
     json_response(200, format!("[{}]", rows.join(", ")))
 }
 
@@ -344,8 +354,8 @@ fn handle_delete_account(conn: &Connection, id: &str) -> Response<Cursor<Vec<u8>
 // --- Routing ----------------------------------------------------------------
 //
 // Dispatch skeleton: matches method + path against the known resource
-// routes. No handlers exist yet (they land in #5/#6/#7), so every arm is a
-// 404 stub for now; each ticket swaps its arm's body for a real call.
+// routes. Accounts/transactions arms are 404 stubs for now (#6/#7); each
+// ticket swaps its arm's body for a real call.
 
 fn route(conn: &Connection, method: &Method, path: &str, body: &str) -> Response<Cursor<Vec<u8>>> {
     let segments: Vec<&str> = path
@@ -355,16 +365,16 @@ fn route(conn: &Connection, method: &Method, path: &str, body: &str) -> Response
         .collect();
 
     match (method, segments.as_slice()) {
-        (Method::Post, ["currencies"]) => not_found(),
-        (Method::Get, ["currencies"]) => not_found(),
+        (Method::Post, ["currencies"]) => create_currency(conn, body),
+        (Method::Get, ["currencies"]) => list_currencies(conn),
 
         (Method::Post, ["accounts"]) => handle_create_account(conn, body),
         (Method::Get, ["accounts"]) => handle_list_accounts(conn),
         (Method::Delete, ["accounts", id]) => handle_delete_account(conn, id),
 
-        (Method::Post, ["categories"]) => not_found(),
-        (Method::Get, ["categories"]) => not_found(),
-        (Method::Delete, ["categories", _id]) => not_found(),
+        (Method::Post, ["categories"]) => create_category(conn, body),
+        (Method::Get, ["categories"]) => list_categories(conn),
+        (Method::Delete, ["categories", id]) => delete_category(conn, id),
 
         (Method::Post, ["transactions", "batch"]) => not_found(),
         (Method::Post, ["transactions"]) => not_found(),
@@ -421,6 +431,7 @@ mod tests {
 
     fn setup() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
         conn.execute_batch(SCHEMA).unwrap();
         conn
     }
@@ -461,15 +472,8 @@ mod tests {
 
     #[test]
     fn unmatched_route_is_404_with_error_envelope() {
-        let conn = test_db();
+        let conn = setup();
         let response = route(&conn, &Method::Get, "/nope", "");
-        assert_eq!(response.status_code().0, 404);
-    }
-
-    #[test]
-    fn known_route_is_stubbed_404_for_now() {
-        let conn = test_db();
-        let response = route(&conn, &Method::Get, "/currencies", "");
         assert_eq!(response.status_code().0, 404);
     }
 
@@ -554,6 +558,70 @@ mod tests {
         .unwrap();
         let response = route(&conn, &Method::Delete, "/accounts/1", "");
         assert_eq!(response.status_code().0, 400);
+    }
+
+    #[test]
+    fn create_and_list_currencies() {
+        let conn = setup();
+        let response = route(
+            &conn,
+            &Method::Post,
+            "/currencies",
+            r#"{"code": "SEK", "minor_unit": 2}"#,
+        );
+        assert_eq!(response.status_code().0, 201);
+
+        let response = route(&conn, &Method::Get, "/currencies", "");
+        assert_eq!(response.status_code().0, 200);
+    }
+
+    #[test]
+    fn duplicate_currency_code_is_409() {
+        let conn = setup();
+        let body = r#"{"code": "SEK", "minor_unit": 2}"#;
+        assert_eq!(route(&conn, &Method::Post, "/currencies", body).status_code().0, 201);
+        assert_eq!(route(&conn, &Method::Post, "/currencies", body).status_code().0, 409);
+    }
+
+    #[test]
+    fn create_list_and_delete_category() {
+        let conn = setup();
+        let response = route(&conn, &Method::Post, "/categories", r#"{"name": "Food"}"#);
+        assert_eq!(response.status_code().0, 201);
+
+        let response = route(&conn, &Method::Get, "/categories", "");
+        assert_eq!(response.status_code().0, 200);
+
+        let response = route(&conn, &Method::Delete, "/categories/1", "");
+        assert_eq!(response.status_code().0, 204);
+
+        let response = route(&conn, &Method::Delete, "/categories/1", "");
+        assert_eq!(response.status_code().0, 404);
+    }
+
+    #[test]
+    fn deleting_category_nulls_referencing_transactions() {
+        let conn = setup();
+        conn.execute_batch(
+            "
+            INSERT INTO currencies (id, code, minor_unit) VALUES (1, 'SEK', 2);
+            INSERT INTO accounts (id, name, type, currency_id) VALUES
+                (1, 'Own', 'own', 1), (2, 'External', 'external', NULL);
+            INSERT INTO categories (id, name) VALUES (1, 'Food');
+            INSERT INTO transactions
+                (id, description, date, amount, account_id, opposing_account_id, category_id)
+                VALUES ('t1', 'lunch', '2024-01-01', -100, 1, 2, 1);
+            ",
+        )
+        .unwrap();
+
+        let response = route(&conn, &Method::Delete, "/categories/1", "");
+        assert_eq!(response.status_code().0, 204);
+
+        let category_id: Option<i64> = conn
+            .query_row("SELECT category_id FROM transactions WHERE id = 't1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(category_id, None);
     }
 
     #[test]
