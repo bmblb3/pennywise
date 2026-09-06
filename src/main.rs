@@ -206,6 +206,35 @@ fn json_string(s: &str) -> String {
     format!("\"{}\"", json_escape(s))
 }
 
+/// Whether a flat JSON object's *top level* names `key` at all (present with
+/// any value, including `null`) — distinct from `json_str_field`/
+/// `json_int_field`, which can't tell "absent" from "present but null/wrong
+/// type". Only matches a quoted string in key position (preceded by `{` or
+/// `,`, followed by `:`), so a field *value* that happens to contain the same
+/// text (e.g. `{"description": "amount"}`) isn't mistaken for the key.
+fn json_has_key(body: &str, key: &str) -> bool {
+    let needle = format!("\"{key}\"");
+    let mut from = 0;
+    while let Some(idx) = body[from..].find(&needle) {
+        let at = from + idx;
+        let before = body[..at].trim_end();
+        let after = body[at + needle.len()..].trim_start();
+        if (before.ends_with('{') || before.ends_with(',')) && after.starts_with(':') {
+            return true;
+        }
+        from = at + needle.len();
+    }
+    false
+}
+
+fn json_opt_int(v: Option<i64>) -> String {
+    v.map(|n| n.to_string()).unwrap_or_else(|| "null".to_string())
+}
+
+fn json_opt_string(v: Option<&str>) -> String {
+    v.map(json_string).unwrap_or_else(|| "null".to_string())
+}
+
 /// Splits out each top-level `{...}` object from a string, skipping over
 /// quoted strings so braces/brackets inside a description don't confuse the
 /// brace count. Used to pull the repeated transaction objects out of a
@@ -363,11 +392,11 @@ fn account_json(row: &rusqlite::Row) -> rusqlite::Result<String> {
         r#"{{"id": {id}, "name": {}, "type": {}, "currency_id": {}}}"#,
         json_string(&name),
         json_string(&r#type),
-        currency_id.map(|c| c.to_string()).unwrap_or_else(|| "null".to_string()),
+        json_opt_int(currency_id),
     ))
 }
 
-fn handle_create_account(conn: &Connection, body: &str) -> Response<Cursor<Vec<u8>>> {
+fn create_account(conn: &Connection, body: &str) -> Response<Cursor<Vec<u8>>> {
     let (Some(name), Some(account_type)) =
         (json_str_field(body, "name"), json_str_field(body, "type"))
     else {
@@ -385,7 +414,7 @@ fn handle_create_account(conn: &Connection, body: &str) -> Response<Cursor<Vec<u
     }
 }
 
-fn handle_list_accounts(conn: &Connection) -> Response<Cursor<Vec<u8>>> {
+fn list_accounts(conn: &Connection) -> Response<Cursor<Vec<u8>>> {
     let mut stmt = conn
         .prepare("SELECT id, name, type, currency_id FROM accounts")
         .expect("failed to prepare accounts query");
@@ -397,7 +426,7 @@ fn handle_list_accounts(conn: &Connection) -> Response<Cursor<Vec<u8>>> {
     json_response(200, format!("[{}]", rows.join(", ")))
 }
 
-fn handle_delete_account(conn: &Connection, id: &str) -> Response<Cursor<Vec<u8>>> {
+fn delete_account(conn: &Connection, id: &str) -> Response<Cursor<Vec<u8>>> {
     let Ok(id) = id.parse::<i64>() else {
         return not_found();
     };
@@ -425,11 +454,11 @@ fn transaction_json(row: &rusqlite::Row) -> rusqlite::Result<String> {
     Ok(format!(
         r#"{{"id": {}, "batch_id": {}, "description": {}, "date": {}, "amount": {amount}, "opposing_amount": {}, "account_id": {account_id}, "opposing_account_id": {opposing_account_id}, "category_id": {}, "created_at": {}, "updated_at": {}}}"#,
         json_string(&id),
-        batch_id.map(|b| json_string(&b)).unwrap_or_else(|| "null".to_string()),
+        json_opt_string(batch_id.as_deref()),
         json_string(&description),
         json_string(&date),
-        opposing_amount.map(|a| a.to_string()).unwrap_or_else(|| "null".to_string()),
-        category_id.map(|c| c.to_string()).unwrap_or_else(|| "null".to_string()),
+        json_opt_int(opposing_amount),
+        json_opt_int(category_id),
         json_string(&created_at),
         json_string(&updated_at),
     ))
@@ -533,20 +562,26 @@ fn list_transactions(conn: &Connection) -> Response<Cursor<Vec<u8>>> {
 const IMMUTABLE_TRANSACTION_FIELDS: [&str; 6] =
     ["amount", "date", "account_id", "opposing_account_id", "batch_id", "id"];
 
-fn handle_patch_transaction(conn: &Connection, id: &str, body: &str) -> Response<Cursor<Vec<u8>>> {
+fn patch_transaction(conn: &Connection, id: &str, body: &str) -> Response<Cursor<Vec<u8>>> {
     let names_immutable_field = IMMUTABLE_TRANSACTION_FIELDS
         .iter()
-        .any(|f| body.contains(&format!("\"{f}\"")));
+        .any(|f| json_has_key(body, f));
     if names_immutable_field {
         return error_response(400, "only description and category_id may be updated");
     }
 
     let description = json_str_field(body, "description");
+    // category_id may be legitimately cleared to NULL, so "present" (even as
+    // `null`) and "absent" need different SQL behavior — COALESCE alone can't
+    // tell "leave unchanged" from "set to NULL".
+    let category_id_given = json_has_key(body, "category_id");
     let category_id = json_int_field(body, "category_id");
 
     let updated = conn.execute(
-        "UPDATE transactions SET description = COALESCE(?1, description), category_id = COALESCE(?2, category_id), updated_at = datetime('now') WHERE id = ?3",
-        rusqlite::params![description, category_id, id],
+        "UPDATE transactions SET description = COALESCE(?1, description), \
+         category_id = CASE WHEN ?2 THEN ?3 ELSE category_id END, \
+         updated_at = datetime('now') WHERE id = ?4",
+        rusqlite::params![description, category_id_given, category_id, id],
     );
     match updated {
         Ok(0) => not_found(),
@@ -562,7 +597,7 @@ fn handle_patch_transaction(conn: &Connection, id: &str, body: &str) -> Response
     }
 }
 
-fn handle_delete_transaction(conn: &Connection, id: &str) -> Response<Cursor<Vec<u8>>> {
+fn delete_transaction(conn: &Connection, id: &str) -> Response<Cursor<Vec<u8>>> {
     match conn.execute("DELETE FROM transactions WHERE id = ?1", [id]) {
         Ok(0) => not_found(),
         Ok(_) => Response::from_string("").with_status_code(204),
@@ -586,9 +621,9 @@ fn route(conn: &Connection, method: &Method, path: &str, body: &str) -> Response
         (Method::Post, ["currencies"]) => create_currency(conn, body),
         (Method::Get, ["currencies"]) => list_currencies(conn),
 
-        (Method::Post, ["accounts"]) => handle_create_account(conn, body),
-        (Method::Get, ["accounts"]) => handle_list_accounts(conn),
-        (Method::Delete, ["accounts", id]) => handle_delete_account(conn, id),
+        (Method::Post, ["accounts"]) => create_account(conn, body),
+        (Method::Get, ["accounts"]) => list_accounts(conn),
+        (Method::Delete, ["accounts", id]) => delete_account(conn, id),
 
         (Method::Post, ["categories"]) => create_category(conn, body),
         (Method::Get, ["categories"]) => list_categories(conn),
@@ -597,8 +632,8 @@ fn route(conn: &Connection, method: &Method, path: &str, body: &str) -> Response
         (Method::Post, ["transactions", "batch"]) => create_transactions_batch(conn, body),
         (Method::Post, ["transactions"]) => create_transaction(conn, body),
         (Method::Get, ["transactions"]) => list_transactions(conn),
-        (Method::Patch, ["transactions", id]) => handle_patch_transaction(conn, id, body),
-        (Method::Delete, ["transactions", id]) => handle_delete_transaction(conn, id),
+        (Method::Patch, ["transactions", id]) => patch_transaction(conn, id, body),
+        (Method::Delete, ["transactions", id]) => delete_transaction(conn, id),
 
         _ => not_found(),
     }
@@ -1012,6 +1047,63 @@ mod tests {
             .query_row("SELECT description FROM transactions WHERE id = 't1'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(description, "Old", "rejected PATCH must not have mutated the row");
+    }
+
+    #[test]
+    fn patch_can_clear_category_id_to_null() {
+        let conn = test_db();
+        conn.execute_batch(
+            "
+            INSERT INTO categories (id, name) VALUES (1, 'Food');
+            INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id, category_id)
+                VALUES ('t1', 'Old', '2024-01-01', -100, 1, 4, 1);
+            ",
+        )
+        .unwrap();
+
+        let response = route(&conn, &Method::Patch, "/transactions/t1", r#"{"category_id": null}"#);
+        assert_eq!(response.status_code().0, 200);
+
+        let category_id: Option<i64> = conn
+            .query_row("SELECT category_id FROM transactions WHERE id = 't1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(category_id, None);
+    }
+
+    #[test]
+    fn patch_omitting_category_id_leaves_it_unchanged() {
+        let conn = test_db();
+        conn.execute_batch(
+            "
+            INSERT INTO categories (id, name) VALUES (1, 'Food');
+            INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id, category_id)
+                VALUES ('t1', 'Old', '2024-01-01', -100, 1, 4, 1);
+            ",
+        )
+        .unwrap();
+
+        let response = route(&conn, &Method::Patch, "/transactions/t1", r#"{"description": "New"}"#);
+        assert_eq!(response.status_code().0, 200);
+
+        let category_id: Option<i64> = conn
+            .query_row("SELECT category_id FROM transactions WHERE id = 't1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(category_id, Some(1), "omitting category_id must not clear it");
+    }
+
+    #[test]
+    fn patch_value_containing_immutable_field_name_is_not_rejected() {
+        let conn = test_db();
+        conn.execute(
+            "INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id) VALUES ('t1', 'Old', '2024-01-01', -100, 1, 4)",
+            [],
+        )
+        .unwrap();
+
+        // The word "amount" appears in the *value*, not as a JSON key — must not
+        // trip the immutable-field check.
+        let response = route(&conn, &Method::Patch, "/transactions/t1", r#"{"description": "amount due"}"#);
+        assert_eq!(response.status_code().0, 200);
     }
 
     #[test]
