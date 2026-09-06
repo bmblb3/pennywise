@@ -83,6 +83,41 @@ fn migrate(conn: &Connection) {
     }
 }
 
+/// The one shared cross-table validation function every transaction insert/update
+/// path must call (see docs/spec-v1.md "Cross-table validation"). Everything else
+/// (id existence, own-account-has-currency, external-account-has-no-currency) is
+/// already enforced by the schema's CHECK/REFERENCES + PRAGMA foreign_keys = ON.
+#[allow(dead_code)] // consumed by the transactions endpoints (#7), not yet wired up
+fn validate_transaction(
+    conn: &Connection,
+    account_id: i64,
+    opposing_account_id: i64,
+    opposing_amount: Option<i64>,
+) -> Result<(), String> {
+    let lookup = |id: i64| -> Result<(String, Option<i64>), String> {
+        conn.query_row(
+            "SELECT type, currency_id FROM accounts WHERE id = ?1",
+            [id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .map_err(|_| format!("account {id} does not exist"))
+    };
+
+    let (account_type, account_currency) = lookup(account_id)?;
+    if account_type != "own" {
+        return Err(format!("account {account_id} must be of type 'own'"));
+    }
+
+    let (opposing_type, opposing_currency) = lookup(opposing_account_id)?;
+    let needs_opposing_amount = opposing_type == "own" && opposing_currency != account_currency;
+
+    match (needs_opposing_amount, opposing_amount) {
+        (true, None) => Err("opposing_amount is required when both accounts are 'own' with differing currencies".to_string()),
+        (false, Some(_)) => Err("opposing_amount must be NULL unless both accounts are 'own' with differing currencies".to_string()),
+        _ => Ok(()),
+    }
+}
+
 fn main() {
     let config = Config::from_args();
 
@@ -95,5 +130,64 @@ fn main() {
     for request in server.incoming_requests() {
         let response = Response::from_string("Not Implemented").with_status_code(501);
         let _ = request.respond(response);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Sets up an in-memory DB with two currencies (SEK id 1, USD id 2) and four
+    /// accounts: 1 = own/SEK, 2 = own/SEK, 3 = own/USD, 4 = external.
+    fn test_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        migrate(&conn);
+        conn.execute_batch(
+            "
+            INSERT INTO currencies (id, code, minor_unit) VALUES (1, 'SEK', 2), (2, 'USD', 2);
+            INSERT INTO accounts (id, name, type, currency_id) VALUES
+                (1, 'Own SEK A', 'own', 1),
+                (2, 'Own SEK B', 'own', 1),
+                (3, 'Own USD', 'own', 2),
+                (4, 'External', 'external', NULL);
+            ",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn same_currency_own_to_own_rejects_opposing_amount() {
+        let conn = test_db();
+        assert!(validate_transaction(&conn, 1, 2, None).is_ok());
+        assert!(validate_transaction(&conn, 1, 2, Some(500)).is_err());
+    }
+
+    #[test]
+    fn cross_currency_own_to_own_requires_opposing_amount() {
+        let conn = test_db();
+        assert!(validate_transaction(&conn, 1, 3, Some(500)).is_ok());
+        assert!(validate_transaction(&conn, 1, 3, None).is_err());
+    }
+
+    #[test]
+    fn own_to_external_rejects_opposing_amount() {
+        let conn = test_db();
+        assert!(validate_transaction(&conn, 1, 4, None).is_ok());
+        assert!(validate_transaction(&conn, 1, 4, Some(500)).is_err());
+    }
+
+    #[test]
+    fn external_as_account_id_is_rejected() {
+        let conn = test_db();
+        assert!(validate_transaction(&conn, 4, 1, None).is_err());
+    }
+
+    #[test]
+    fn nonexistent_account_is_rejected() {
+        let conn = test_db();
+        assert!(validate_transaction(&conn, 99, 1, None).is_err());
+        assert!(validate_transaction(&conn, 1, 99, None).is_err());
     }
 }
