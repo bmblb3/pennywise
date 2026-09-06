@@ -1,0 +1,8 @@
+[package]
+name = "pennywise"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tiny_http = "0.12"
+rusqlite = { version = "0.31", features = ["bundled"] }
