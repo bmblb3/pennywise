@@ -172,13 +172,182 @@ fn db_error_response(err: &rusqlite::Error) -> Response<Cursor<Vec<u8>>> {
     error_response(status, &message)
 }
 
+// --- Minimal JSON -----------------------------------------------------------
+//
+// No JSON crate is in Cargo.toml yet, and the shapes here are flat
+// string/number/null fields on a single object, so a tiny hand-rolled
+// reader/writer beats pulling in serde for this.
+
+#[derive(Debug, PartialEq)]
+enum JsonValue {
+    Str(String),
+    Num(i64),
+    Null,
+}
+
+/// Parses a flat `{"key": "str" | 123 | null, ...}` object. No nesting, no
+/// arrays, no floats — nothing here needs them.
+fn parse_json_object(body: &str) -> Result<Vec<(String, JsonValue)>, String> {
+    let mut chars = body.trim().chars().peekable();
+    let err = || "invalid JSON body".to_string();
+
+    if chars.next() != Some('{') {
+        return Err(err());
+    }
+
+    let mut fields = Vec::new();
+    loop {
+        while chars.peek() == Some(&' ') || chars.peek() == Some(&'\n') || chars.peek() == Some(&'\t') || chars.peek() == Some(&'\r') {
+            chars.next();
+        }
+        if chars.peek() == Some(&'}') {
+            chars.next();
+            break;
+        }
+        let key = parse_json_string(&mut chars).ok_or_else(err)?;
+        while matches!(chars.peek(), Some(' ') | Some('\n') | Some('\t') | Some('\r')) {
+            chars.next();
+        }
+        if chars.next() != Some(':') {
+            return Err(err());
+        }
+        while matches!(chars.peek(), Some(' ') | Some('\n') | Some('\t') | Some('\r')) {
+            chars.next();
+        }
+        let value = if chars.peek() == Some(&'"') {
+            JsonValue::Str(parse_json_string(&mut chars).ok_or_else(err)?)
+        } else {
+            let mut token = String::new();
+            while let Some(&c) = chars.peek() {
+                if c == ',' || c == '}' {
+                    break;
+                }
+                token.push(c);
+                chars.next();
+            }
+            let token = token.trim();
+            if token == "null" {
+                JsonValue::Null
+            } else {
+                JsonValue::Num(token.parse::<i64>().map_err(|_| err())?)
+            }
+        };
+        fields.push((key, value));
+        while matches!(chars.peek(), Some(' ') | Some('\n') | Some('\t') | Some('\r')) {
+            chars.next();
+        }
+        match chars.next() {
+            Some(',') => continue,
+            Some('}') => break,
+            _ => return Err(err()),
+        }
+    }
+    Ok(fields)
+}
+
+fn parse_json_string(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<String> {
+    if chars.next() != Some('"') {
+        return None;
+    }
+    let mut s = String::new();
+    loop {
+        match chars.next()? {
+            '"' => return Some(s),
+            '\\' => match chars.next()? {
+                '"' => s.push('"'),
+                '\\' => s.push('\\'),
+                other => s.push(other),
+            },
+            c => s.push(c),
+        }
+    }
+}
+
+fn get_str<'a>(fields: &'a [(String, JsonValue)], key: &str) -> Option<&'a str> {
+    fields.iter().find(|(k, _)| k == key).and_then(|(_, v)| match v {
+        JsonValue::Str(s) => Some(s.as_str()),
+        _ => None,
+    })
+}
+
+fn get_i64_opt(fields: &[(String, JsonValue)], key: &str) -> Option<Option<i64>> {
+    fields.iter().find(|(k, _)| k == key).map(|(_, v)| match v {
+        JsonValue::Num(n) => Some(*n),
+        _ => None,
+    })
+}
+
+// --- Accounts handlers --------------------------------------------------
+
+fn account_json(id: i64, name: &str, r#type: &str, currency_id: Option<i64>) -> String {
+    format!(
+        r#"{{"id": {}, "name": "{}", "type": "{}", "currency_id": {}}}"#,
+        id,
+        json_escape(name),
+        json_escape(r#type),
+        currency_id.map(|c| c.to_string()).unwrap_or_else(|| "null".to_string()),
+    )
+}
+
+fn handle_create_account(conn: &Connection, body: &str) -> Response<Cursor<Vec<u8>>> {
+    let fields = match parse_json_object(body) {
+        Ok(f) => f,
+        Err(e) => return error_response(400, &e),
+    };
+    let (Some(name), Some(account_type)) = (get_str(&fields, "name"), get_str(&fields, "type")) else {
+        return error_response(400, "name and type are required");
+    };
+    let currency_id = get_i64_opt(&fields, "currency_id").unwrap_or(None);
+
+    match conn.execute(
+        "INSERT INTO accounts (name, type, currency_id) VALUES (?1, ?2, ?3)",
+        rusqlite::params![name, account_type, currency_id],
+    ) {
+        Ok(_) => {
+            let id = conn.last_insert_rowid();
+            json_response(201, account_json(id, name, account_type, currency_id))
+        }
+        Err(e) => db_error_response(&e),
+    }
+}
+
+fn handle_list_accounts(conn: &Connection) -> Response<Cursor<Vec<u8>>> {
+    let mut stmt = conn
+        .prepare("SELECT id, name, type, currency_id FROM accounts")
+        .expect("failed to prepare accounts query");
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(account_json(
+                row.get(0)?,
+                &row.get::<_, String>(1)?,
+                &row.get::<_, String>(2)?,
+                row.get(3)?,
+            ))
+        })
+        .expect("failed to query accounts")
+        .map(|r| r.expect("failed to read account row"))
+        .collect::<Vec<_>>();
+    json_response(200, format!("[{}]", rows.join(", ")))
+}
+
+fn handle_delete_account(conn: &Connection, id: &str) -> Response<Cursor<Vec<u8>>> {
+    let Ok(id) = id.parse::<i64>() else {
+        return not_found();
+    };
+    match conn.execute("DELETE FROM accounts WHERE id = ?1", [id]) {
+        Ok(0) => not_found(),
+        Ok(_) => Response::from_string("").with_status_code(204),
+        Err(e) => db_error_response(&e),
+    }
+}
+
 // --- Routing ----------------------------------------------------------------
 //
 // Dispatch skeleton: matches method + path against the known resource
 // routes. No handlers exist yet (they land in #5/#6/#7), so every arm is a
 // 404 stub for now; each ticket swaps its arm's body for a real call.
 
-fn route(method: &Method, path: &str) -> Response<Cursor<Vec<u8>>> {
+fn route(conn: &Connection, method: &Method, path: &str, body: &str) -> Response<Cursor<Vec<u8>>> {
     let segments: Vec<&str> = path
         .trim_matches('/')
         .split('/')
@@ -189,9 +358,9 @@ fn route(method: &Method, path: &str) -> Response<Cursor<Vec<u8>>> {
         (Method::Post, ["currencies"]) => not_found(),
         (Method::Get, ["currencies"]) => not_found(),
 
-        (Method::Post, ["accounts"]) => not_found(),
-        (Method::Get, ["accounts"]) => not_found(),
-        (Method::Delete, ["accounts", _id]) => not_found(),
+        (Method::Post, ["accounts"]) => handle_create_account(conn, body),
+        (Method::Get, ["accounts"]) => handle_list_accounts(conn),
+        (Method::Delete, ["accounts", id]) => handle_delete_account(conn, id),
 
         (Method::Post, ["categories"]) => not_found(),
         (Method::Get, ["categories"]) => not_found(),
@@ -212,15 +381,16 @@ fn main() {
 
     let conn = open_db(&config.db);
     migrate(&conn);
-    let _ = conn; // wired up by resource-endpoint tickets
 
     let server = Server::http(&config.bind).expect("failed to bind server");
     println!("listening on {}", config.bind);
 
-    for request in server.incoming_requests() {
+    for mut request in server.incoming_requests() {
         let method = request.method().clone();
         let path = request.url().split('?').next().unwrap_or("").to_string();
-        let response = route(&method, &path);
+        let mut body = String::new();
+        let _ = request.as_reader().read_to_string(&mut body);
+        let response = route(&conn, &method, &path, &body);
         let _ = request.respond(response);
     }
 }
@@ -291,13 +461,15 @@ mod tests {
 
     #[test]
     fn unmatched_route_is_404_with_error_envelope() {
-        let response = route(&Method::Get, "/nope");
+        let conn = test_db();
+        let response = route(&conn, &Method::Get, "/nope", "");
         assert_eq!(response.status_code().0, 404);
     }
 
     #[test]
     fn known_route_is_stubbed_404_for_now() {
-        let response = route(&Method::Get, "/currencies");
+        let conn = test_db();
+        let response = route(&conn, &Method::Get, "/currencies", "");
         assert_eq!(response.status_code().0, 404);
     }
 
@@ -323,6 +495,65 @@ mod tests {
             .unwrap_err();
         let (status, _) = map_db_error(&err);
         assert_eq!(status, 400);
+    }
+
+    #[test]
+    fn create_account_returns_201_with_row() {
+        let conn = test_db();
+        let response = route(&conn, &Method::Post, "/accounts", r#"{"name": "New", "type": "own", "currency_id": 1}"#);
+        assert_eq!(response.status_code().0, 201);
+    }
+
+    #[test]
+    fn create_own_account_without_currency_is_400() {
+        let conn = test_db();
+        let response = route(&conn, &Method::Post, "/accounts", r#"{"name": "New", "type": "own"}"#);
+        assert_eq!(response.status_code().0, 400);
+    }
+
+    #[test]
+    fn create_external_account_with_currency_is_400() {
+        let conn = test_db();
+        let response = route(
+            &conn,
+            &Method::Post,
+            "/accounts",
+            r#"{"name": "New", "type": "external", "currency_id": 1}"#,
+        );
+        assert_eq!(response.status_code().0, 400);
+    }
+
+    #[test]
+    fn list_accounts_returns_200() {
+        let conn = test_db();
+        let response = route(&conn, &Method::Get, "/accounts", "");
+        assert_eq!(response.status_code().0, 200);
+    }
+
+    #[test]
+    fn delete_account_returns_204() {
+        let conn = test_db();
+        let response = route(&conn, &Method::Delete, "/accounts/4", "");
+        assert_eq!(response.status_code().0, 204);
+    }
+
+    #[test]
+    fn delete_unknown_account_returns_404() {
+        let conn = test_db();
+        let response = route(&conn, &Method::Delete, "/accounts/999", "");
+        assert_eq!(response.status_code().0, 404);
+    }
+
+    #[test]
+    fn delete_referenced_account_returns_400() {
+        let conn = test_db();
+        conn.execute(
+            "INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id) VALUES ('t1', 'x', '2024-01-01', 100, 1, 4)",
+            [],
+        )
+        .unwrap();
+        let response = route(&conn, &Method::Delete, "/accounts/1", "");
+        assert_eq!(response.status_code().0, 400);
     }
 
     #[test]
