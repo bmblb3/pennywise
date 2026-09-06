@@ -88,7 +88,6 @@ fn migrate(conn: &Connection) {
 /// path must call (see docs/spec-v1.md "Cross-table validation"). Everything else
 /// (id existence, own-account-has-currency, external-account-has-no-currency) is
 /// already enforced by the schema's CHECK/REFERENCES + PRAGMA foreign_keys = ON.
-#[allow(dead_code)] // consumed by the transactions endpoints (#7), not yet wired up
 fn validate_transaction(
     conn: &Connection,
     account_id: i64,
@@ -205,6 +204,64 @@ fn json_int_field(body: &str, key: &str) -> Option<i64> {
 
 fn json_string(s: &str) -> String {
     format!("\"{}\"", json_escape(s))
+}
+
+/// Splits out each top-level `{...}` object from a string, skipping over
+/// quoted strings so braces/brackets inside a description don't confuse the
+/// brace count. Used to pull the repeated transaction objects out of a
+/// `"transactions": [...]` array — the only nesting this API's request
+/// bodies need.
+fn split_json_objects(s: &str) -> Vec<String> {
+    let mut objects = Vec::new();
+    let mut depth = 0;
+    let mut start = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, c) in s.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '{' => {
+                if depth == 0 {
+                    start = i;
+                }
+                depth += 1;
+            }
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    objects.push(s[start..=i].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    objects
+}
+
+/// Extracts a top-level `"key": [ {...}, {...} ]` field as the list of raw
+/// object bodies. No index into the array is needed by callers, so this
+/// skips finding the closing `]` and just collects every balanced `{...}`
+/// after the key — cheaper than tracking the array bound separately.
+fn json_object_array_field(body: &str, key: &str) -> Option<Vec<String>> {
+    let needle = format!("\"{key}\"");
+    let after_key = &body[body.find(&needle)? + needle.len()..];
+    let after_colon = &after_key[after_key.find(':')? + 1..];
+    let objects = split_json_objects(after_colon);
+    if objects.is_empty() {
+        None
+    } else {
+        Some(objects)
+    }
 }
 
 // --- Currencies ---------------------------------------------------------
@@ -351,11 +408,172 @@ fn handle_delete_account(conn: &Connection, id: &str) -> Response<Cursor<Vec<u8>
     }
 }
 
+// --- Transactions handlers -----------------------------------------------
+
+fn transaction_json(row: &rusqlite::Row) -> rusqlite::Result<String> {
+    let id: String = row.get(0)?;
+    let batch_id: Option<String> = row.get(1)?;
+    let description: String = row.get(2)?;
+    let date: String = row.get(3)?;
+    let amount: i64 = row.get(4)?;
+    let opposing_amount: Option<i64> = row.get(5)?;
+    let account_id: i64 = row.get(6)?;
+    let opposing_account_id: i64 = row.get(7)?;
+    let category_id: Option<i64> = row.get(8)?;
+    let created_at: String = row.get(9)?;
+    let updated_at: String = row.get(10)?;
+    Ok(format!(
+        r#"{{"id": {}, "batch_id": {}, "description": {}, "date": {}, "amount": {amount}, "opposing_amount": {}, "account_id": {account_id}, "opposing_account_id": {opposing_account_id}, "category_id": {}, "created_at": {}, "updated_at": {}}}"#,
+        json_string(&id),
+        batch_id.map(|b| json_string(&b)).unwrap_or_else(|| "null".to_string()),
+        json_string(&description),
+        json_string(&date),
+        opposing_amount.map(|a| a.to_string()).unwrap_or_else(|| "null".to_string()),
+        category_id.map(|c| c.to_string()).unwrap_or_else(|| "null".to_string()),
+        json_string(&created_at),
+        json_string(&updated_at),
+    ))
+}
+
+const TRANSACTION_COLUMNS: &str = "id, batch_id, description, date, amount, opposing_amount, \
+    account_id, opposing_account_id, category_id, created_at, updated_at";
+
+/// Shared by `POST /transactions` and each item of `POST /transactions/batch`.
+/// `forced_batch_id` overrides any `batch_id` in `body` — every row in a
+/// batch shares the request's top-level `batch_id`, regardless of what an
+/// individual item says.
+fn insert_transaction(
+    conn: &Connection,
+    body: &str,
+    forced_batch_id: Option<&str>,
+) -> Result<String, Response<Cursor<Vec<u8>>>> {
+    let (Some(id), Some(description), Some(date), Some(amount), Some(account_id), Some(opposing_account_id)) = (
+        json_str_field(body, "id"),
+        json_str_field(body, "description"),
+        json_str_field(body, "date"),
+        json_int_field(body, "amount"),
+        json_int_field(body, "account_id"),
+        json_int_field(body, "opposing_account_id"),
+    ) else {
+        return Err(error_response(
+            400,
+            "expected {id, description, date, amount, account_id, opposing_account_id}",
+        ));
+    };
+    let opposing_amount = json_int_field(body, "opposing_amount");
+    let category_id = json_int_field(body, "category_id");
+    let batch_id = forced_batch_id
+        .map(str::to_string)
+        .or_else(|| json_str_field(body, "batch_id"));
+
+    if let Err(msg) = validate_transaction(conn, account_id, opposing_account_id, opposing_amount) {
+        return Err(error_response(400, &msg));
+    }
+
+    conn.query_row(
+        &format!(
+            "INSERT INTO transactions (id, batch_id, description, date, amount, opposing_amount, account_id, opposing_account_id, category_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             RETURNING {TRANSACTION_COLUMNS}"
+        ),
+        rusqlite::params![id, batch_id, description, date, amount, opposing_amount, account_id, opposing_account_id, category_id],
+        transaction_json,
+    )
+    .map_err(|e| db_error_response(&e))
+}
+
+fn create_transaction(conn: &Connection, body: &str) -> Response<Cursor<Vec<u8>>> {
+    match insert_transaction(conn, body, None) {
+        Ok(json) => json_response(201, json),
+        Err(resp) => resp,
+    }
+}
+
+fn create_transactions_batch(conn: &Connection, body: &str) -> Response<Cursor<Vec<u8>>> {
+    let (Some(batch_id), Some(items)) = (
+        json_str_field(body, "batch_id"),
+        json_object_array_field(body, "transactions"),
+    ) else {
+        return error_response(400, "expected {batch_id, transactions: [...]}");
+    };
+
+    conn.execute_batch("BEGIN").expect("begin batch transaction");
+
+    let mut created = Vec::new();
+    for item in &items {
+        match insert_transaction(conn, item, Some(&batch_id)) {
+            Ok(json) => created.push(json),
+            Err(resp) => {
+                conn.execute_batch("ROLLBACK").expect("rollback batch transaction");
+                return resp;
+            }
+        }
+    }
+
+    conn.execute_batch("COMMIT").expect("commit batch transaction");
+    json_response(201, format!("[{}]", created.join(", ")))
+}
+
+fn list_transactions(conn: &Connection) -> Response<Cursor<Vec<u8>>> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {TRANSACTION_COLUMNS} FROM transactions ORDER BY date DESC, id"
+        ))
+        .expect("prepare list transactions");
+    let rows: Vec<String> = stmt
+        .query_map([], transaction_json)
+        .expect("query transactions")
+        .map(|r| r.expect("read transaction row"))
+        .collect();
+    json_response(200, format!("[{}]", rows.join(", ")))
+}
+
+/// Fields immutable after creation — naming any of these in a PATCH body is
+/// a 400, not a silent no-op (see docs/spec-v1.md "API" -> Transactions).
+const IMMUTABLE_TRANSACTION_FIELDS: [&str; 6] =
+    ["amount", "date", "account_id", "opposing_account_id", "batch_id", "id"];
+
+fn handle_patch_transaction(conn: &Connection, id: &str, body: &str) -> Response<Cursor<Vec<u8>>> {
+    let names_immutable_field = IMMUTABLE_TRANSACTION_FIELDS
+        .iter()
+        .any(|f| body.contains(&format!("\"{f}\"")));
+    if names_immutable_field {
+        return error_response(400, "only description and category_id may be updated");
+    }
+
+    let description = json_str_field(body, "description");
+    let category_id = json_int_field(body, "category_id");
+
+    let updated = conn.execute(
+        "UPDATE transactions SET description = COALESCE(?1, description), category_id = COALESCE(?2, category_id), updated_at = datetime('now') WHERE id = ?3",
+        rusqlite::params![description, category_id, id],
+    );
+    match updated {
+        Ok(0) => not_found(),
+        Ok(_) => conn
+            .query_row(
+                &format!("SELECT {TRANSACTION_COLUMNS} FROM transactions WHERE id = ?1"),
+                [id],
+                transaction_json,
+            )
+            .map(|json| json_response(200, json))
+            .unwrap_or_else(|e| db_error_response(&e)),
+        Err(e) => db_error_response(&e),
+    }
+}
+
+fn handle_delete_transaction(conn: &Connection, id: &str) -> Response<Cursor<Vec<u8>>> {
+    match conn.execute("DELETE FROM transactions WHERE id = ?1", [id]) {
+        Ok(0) => not_found(),
+        Ok(_) => Response::from_string("").with_status_code(204),
+        Err(e) => db_error_response(&e),
+    }
+}
+
 // --- Routing ----------------------------------------------------------------
 //
 // Dispatch skeleton: matches method + path against the known resource
-// routes. Accounts/transactions arms are 404 stubs for now (#6/#7); each
-// ticket swaps its arm's body for a real call.
+// routes.
 
 fn route(conn: &Connection, method: &Method, path: &str, body: &str) -> Response<Cursor<Vec<u8>>> {
     let segments: Vec<&str> = path
@@ -376,11 +594,11 @@ fn route(conn: &Connection, method: &Method, path: &str, body: &str) -> Response
         (Method::Get, ["categories"]) => list_categories(conn),
         (Method::Delete, ["categories", id]) => delete_category(conn, id),
 
-        (Method::Post, ["transactions", "batch"]) => not_found(),
-        (Method::Post, ["transactions"]) => not_found(),
-        (Method::Get, ["transactions"]) => not_found(),
-        (Method::Patch, ["transactions", _id]) => not_found(),
-        (Method::Delete, ["transactions", _id]) => not_found(),
+        (Method::Post, ["transactions", "batch"]) => create_transactions_batch(conn, body),
+        (Method::Post, ["transactions"]) => create_transaction(conn, body),
+        (Method::Get, ["transactions"]) => list_transactions(conn),
+        (Method::Patch, ["transactions", id]) => handle_patch_transaction(conn, id, body),
+        (Method::Delete, ["transactions", id]) => handle_delete_transaction(conn, id),
 
         _ => not_found(),
     }
@@ -634,5 +852,195 @@ mod tests {
             .unwrap_err();
         let response = db_error_response(&err);
         assert_eq!(response.status_code().0, 409);
+    }
+
+    fn response_body(response: Response<Cursor<Vec<u8>>>) -> String {
+        String::from_utf8(response.into_reader().into_inner()).unwrap()
+    }
+
+    const TXN_BODY: &str = r#"{"id": "t1", "description": "Coffee", "date": "2024-01-01", "amount": -500, "account_id": 1, "opposing_account_id": 4}"#;
+
+    #[test]
+    fn create_transaction_returns_201_with_row() {
+        let conn = test_db();
+        let response = route(&conn, &Method::Post, "/transactions", TXN_BODY);
+        assert_eq!(response.status_code().0, 201);
+        assert!(response_body(response).contains(r#""id": "t1""#));
+    }
+
+    #[test]
+    fn create_transaction_validation_failure_is_400() {
+        let conn = test_db();
+        // account_id must be 'own'; account 4 is 'external'.
+        let body = r#"{"id": "t1", "description": "Coffee", "date": "2024-01-01", "amount": -500, "account_id": 4, "opposing_account_id": 1}"#;
+        let response = route(&conn, &Method::Post, "/transactions", body);
+        assert_eq!(response.status_code().0, 400);
+
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM transactions", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn duplicate_transaction_id_is_409() {
+        let conn = test_db();
+        assert_eq!(route(&conn, &Method::Post, "/transactions", TXN_BODY).status_code().0, 201);
+        assert_eq!(route(&conn, &Method::Post, "/transactions", TXN_BODY).status_code().0, 409);
+    }
+
+    #[test]
+    fn batch_insert_succeeds_and_shares_batch_id() {
+        let conn = test_db();
+        let body = r#"{
+            "batch_id": "b1",
+            "transactions": [
+                {"id": "t1", "description": "Coffee", "date": "2024-01-01", "amount": -500, "account_id": 1, "opposing_account_id": 4},
+                {"id": "t2", "description": "Lunch", "date": "2024-01-02", "amount": -1000, "account_id": 1, "opposing_account_id": 4}
+            ]
+        }"#;
+        let response = route(&conn, &Method::Post, "/transactions/batch", body);
+        assert_eq!(response.status_code().0, 201);
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM transactions WHERE batch_id = 'b1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn batch_rolls_back_entirely_on_one_invalid_row() {
+        let conn = test_db();
+        let body = r#"{
+            "batch_id": "b1",
+            "transactions": [
+                {"id": "t1", "description": "Coffee", "date": "2024-01-01", "amount": -500, "account_id": 1, "opposing_account_id": 4},
+                {"id": "t2", "description": "Bad", "date": "2024-01-02", "amount": -1000, "account_id": 4, "opposing_account_id": 1}
+            ]
+        }"#;
+        let response = route(&conn, &Method::Post, "/transactions/batch", body);
+        assert_eq!(response.status_code().0, 400);
+
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM transactions", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0, "no row from a rolled-back batch should persist");
+    }
+
+    #[test]
+    fn batch_rolls_back_entirely_on_duplicate_id() {
+        let conn = test_db();
+        conn.execute(
+            "INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id) VALUES ('t1', 'x', '2024-01-01', -100, 1, 4)",
+            [],
+        )
+        .unwrap();
+        let body = r#"{
+            "batch_id": "b1",
+            "transactions": [
+                {"id": "t2", "description": "Coffee", "date": "2024-01-02", "amount": -500, "account_id": 1, "opposing_account_id": 4},
+                {"id": "t1", "description": "Dup", "date": "2024-01-03", "amount": -1000, "account_id": 1, "opposing_account_id": 4}
+            ]
+        }"#;
+        let response = route(&conn, &Method::Post, "/transactions/batch", body);
+        assert_eq!(response.status_code().0, 409);
+
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM transactions", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 1, "only the pre-existing row should remain; t2 must not persist");
+    }
+
+    #[test]
+    fn list_transactions_orders_by_date_desc_then_id() {
+        let conn = test_db();
+        conn.execute_batch(
+            "
+            INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id) VALUES
+                ('a', 'x', '2024-01-01', -100, 1, 4),
+                ('b', 'x', '2024-01-03', -100, 1, 4),
+                ('c', 'x', '2024-01-02', -100, 1, 4);
+            ",
+        )
+        .unwrap();
+
+        let response = route(&conn, &Method::Get, "/transactions", "");
+        assert_eq!(response.status_code().0, 200);
+        let body = response_body(response);
+        let pos_a = body.find(r#""id": "a""#).unwrap();
+        let pos_b = body.find(r#""id": "b""#).unwrap();
+        let pos_c = body.find(r#""id": "c""#).unwrap();
+        assert!(pos_b < pos_c && pos_c < pos_a, "expected order b, c, a but got: {body}");
+    }
+
+    #[test]
+    fn patch_updates_description_and_category_id() {
+        let conn = test_db();
+        conn.execute_batch(
+            "
+            INSERT INTO categories (id, name) VALUES (1, 'Food');
+            INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id)
+                VALUES ('t1', 'Old', '2024-01-01', -100, 1, 4);
+            ",
+        )
+        .unwrap();
+
+        let response = route(
+            &conn,
+            &Method::Patch,
+            "/transactions/t1",
+            r#"{"description": "New", "category_id": 1}"#,
+        );
+        assert_eq!(response.status_code().0, 200);
+
+        let (description, category_id): (String, Option<i64>) = conn
+            .query_row("SELECT description, category_id FROM transactions WHERE id = 't1'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(description, "New");
+        assert_eq!(category_id, Some(1));
+    }
+
+    #[test]
+    fn patch_rejecting_immutable_field_is_400() {
+        let conn = test_db();
+        conn.execute(
+            "INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id) VALUES ('t1', 'Old', '2024-01-01', -100, 1, 4)",
+            [],
+        )
+        .unwrap();
+
+        let response = route(&conn, &Method::Patch, "/transactions/t1", r#"{"amount": 500}"#);
+        assert_eq!(response.status_code().0, 400);
+
+        let description: String = conn
+            .query_row("SELECT description FROM transactions WHERE id = 't1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(description, "Old", "rejected PATCH must not have mutated the row");
+    }
+
+    #[test]
+    fn patch_unknown_id_is_404() {
+        let conn = test_db();
+        let response = route(&conn, &Method::Patch, "/transactions/nope", r#"{"description": "New"}"#);
+        assert_eq!(response.status_code().0, 404);
+    }
+
+    #[test]
+    fn delete_transaction_returns_204() {
+        let conn = test_db();
+        conn.execute(
+            "INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id) VALUES ('t1', 'x', '2024-01-01', -100, 1, 4)",
+            [],
+        )
+        .unwrap();
+
+        let response = route(&conn, &Method::Delete, "/transactions/t1", "");
+        assert_eq!(response.status_code().0, 204);
+
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM transactions", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn delete_unknown_transaction_is_404() {
+        let conn = test_db();
+        let response = route(&conn, &Method::Delete, "/transactions/nope", "");
+        assert_eq!(response.status_code().0, 404);
     }
 }
