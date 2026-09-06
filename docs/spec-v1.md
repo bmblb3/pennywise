@@ -21,7 +21,7 @@ Explicitly not built in v1 — no stub, trait, or empty module for any of these:
 
 ## Schema
 
-The table shapes below reflect one substantive change from the original design: Currency moved from the Account to the Transaction (see [ADR-0002](adr/0002-currency-on-transaction.md)) — `accounts.currency_id` is gone; `transactions` gained `currency_id` and `opposing_currency_id`. Two smaller additions remain from the original pass: `amount`/`opposing_amount` are `INTEGER` minor units rather than `REAL` (float drift makes a ledger's core numbers untrustworthy), and `currencies` carries `minor_unit` so the file is self-describing to any consumer that has to format an amount without a hardcoded ISO 4217 table. `categories.category_id`'s `ON DELETE SET NULL` is likewise new — it's required to realize "category deletion never breaks a transaction," which has no default in SQLite.
+The table shapes below are finalized. Two additions were made on top of the original design, both flagged inline: `amount`/`opposing_amount` are `INTEGER` minor units rather than `REAL` (float drift makes a ledger's core numbers untrustworthy), and `currencies` gained `minor_unit` so the file is self-describing to any consumer that has to format an amount without a hardcoded ISO 4217 table. `categories.category_id`'s `ON DELETE SET NULL` is likewise new — it's required to realize "category deletion never breaks a transaction," which has no default in SQLite.
 
 ```sql
 CREATE TABLE currencies (
@@ -31,10 +31,14 @@ CREATE TABLE currencies (
 );
 
 CREATE TABLE accounts (
-    id   INTEGER PRIMARY KEY,
-    name TEXT NOT NULL,
-    type TEXT NOT NULL CHECK (type IN ('own','external'))
-    -- no currency here: an account (own or external) may see transactions in more than one currency
+    id          INTEGER PRIMARY KEY,
+    name        TEXT NOT NULL,
+    type        TEXT NOT NULL CHECK (type IN ('own','external')),
+    currency_id INTEGER REFERENCES currencies(id),
+    CHECK (
+        (type = 'own'      AND currency_id IS NOT NULL) OR
+        (type = 'external' AND currency_id IS NULL)
+    )
 );
 
 CREATE TABLE categories (
@@ -43,21 +47,17 @@ CREATE TABLE categories (
 );
 
 CREATE TABLE transactions (
-    id                    TEXT PRIMARY KEY,   -- caller-supplied (e.g. hash of bank id); sole dedup mechanism
-    batch_id              TEXT,               -- caller-supplied; groups an import for future bulk undo. NULL for standalone entries.
-    description           TEXT NOT NULL,
-    date                  TEXT NOT NULL,
-    amount                INTEGER NOT NULL CHECK (amount != 0),               -- signed minor units; +ve = inflow to account_id
-    currency_id           INTEGER NOT NULL REFERENCES currencies(id),        -- currency of `amount`
-    opposing_amount       INTEGER CHECK (opposing_amount IS NULL OR opposing_amount > 0),  -- unsigned magnitude only
-    opposing_currency_id  INTEGER REFERENCES currencies(id),                  -- NULL means "same as currency_id"
-    account_id            INTEGER NOT NULL REFERENCES accounts(id),
-    opposing_account_id   INTEGER NOT NULL REFERENCES accounts(id),
-    category_id           INTEGER REFERENCES categories(id) ON DELETE SET NULL,
-    created_at            TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at            TEXT NOT NULL DEFAULT (datetime('now')),
-    CHECK ((opposing_amount IS NULL) = (opposing_currency_id IS NULL)),
-    CHECK (opposing_currency_id IS NULL OR opposing_currency_id != currency_id)
+    id                   TEXT PRIMARY KEY,   -- caller-supplied (e.g. hash of bank id); sole dedup mechanism
+    batch_id             TEXT,               -- caller-supplied; groups an import for future bulk undo. NULL for standalone entries.
+    description          TEXT NOT NULL,
+    date                 TEXT NOT NULL,
+    amount               INTEGER NOT NULL CHECK (amount != 0),               -- signed minor units; +ve = inflow to account_id
+    opposing_amount      INTEGER CHECK (opposing_amount IS NULL OR opposing_amount > 0),  -- unsigned magnitude only
+    account_id           INTEGER NOT NULL REFERENCES accounts(id),
+    opposing_account_id  INTEGER NOT NULL REFERENCES accounts(id),
+    category_id          INTEGER REFERENCES categories(id) ON DELETE SET NULL,
+    created_at           TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at           TEXT NOT NULL DEFAULT (datetime('now'))
 );
 ```
 
@@ -79,11 +79,12 @@ On startup, read `PRAGMA user_version`. If `0`, run the embedded schema above on
 
 ## Cross-table validation
 
-Only one rule can't be expressed as a plain `CHECK` (it needs a join, which SQLite `CHECK` can't do). Implement it in **one shared function** that every insert/update path calls:
+Not expressible as SQLite `CHECK` constraints (they span rows/tables). Implement as **one shared function** that every insert/update path calls — never duplicate these checks per-endpoint:
 
 1. `account_id` must reference an account with `type = 'own'`.
+2. `opposing_amount` is required if and only if both `account_id` and `opposing_account_id` are `type = 'own'` and their currencies differ. It is otherwise `NULL`. When present, it is the magnitude on the opposing side only — its sign is always inferred from `amount`'s sign, never stored separately.
 
-The currency-mismatch rule that used to require this join is gone: since `currency_id`/`opposing_currency_id` now live on the transaction itself, the schema's own `CHECK` constraints enforce it — `opposing_amount` and `opposing_currency_id` rise and fall together, and `opposing_currency_id` is never redundantly set equal to `currency_id`. `opposing_amount`, when present, is a magnitude only — its sign is always inferred from `amount`'s sign, never stored separately. Everything else (an account/category id existing at all) is enforced natively by `REFERENCES` plus `PRAGMA foreign_keys = ON`.
+Everything else (an account/category id existing at all, an `own` account having a currency, an `external` account not having one) is already enforced natively by the schema's `CHECK`/`REFERENCES` clauses plus `PRAGMA foreign_keys = ON` — don't re-implement it in application code.
 
 ## API
 
@@ -98,7 +99,7 @@ Standard envelope: `{"error": "<message>"}` on failure. Status codes: `201` crea
 
 ### Accounts
 
-- `POST /accounts` — `{name, type}` — no currency; an account may see transactions in more than one
+- `POST /accounts` — `{name, type, currency_id?}`, validated against the schema's `own`/`external` `CHECK`
 - `GET /accounts` — full list
 - `DELETE /accounts/{id}` — `400` if any transaction still references it (native FK rejection)
 
@@ -113,7 +114,7 @@ Standard envelope: `{"error": "<message>"}` on failure. Status codes: `201` crea
 - `POST /transactions` — one transaction; runs the shared validation function
 - `POST /transactions/batch` — `{batch_id, transactions: [...]}`; every item shares `batch_id` and is run through the same validation function; the whole batch is one SQLite transaction, so a single invalid or duplicate row rolls back the entire batch rather than partially importing it
 - `GET /transactions` — full list, ordered by `date DESC, id`
-- `PATCH /transactions/{id}` — `{description?, category_id?}` only. `amount`, `date`, `account_id`, `opposing_account_id`, `currency_id`, `opposing_currency_id`, `batch_id`, and `id` are immutable; a request naming any of them is a `400`, not a silent no-op. Sets `updated_at` to now.
+- `PATCH /transactions/{id}` — `{description?, category_id?}` only. `amount`, `date`, `account_id`, `opposing_account_id`, `batch_id`, and `id` are immutable; a request naming any of them is a `400`, not a silent no-op. Sets `updated_at` to now.
 - `DELETE /transactions/{id}` — removes the row outright (distinct from editing a structural field, so it doesn't conflict with the immutability rule above)
 
 ## Implementation
