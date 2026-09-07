@@ -1,0 +1,427 @@
+openapi: 3.0.3
+info:
+  title: Pennywise API
+  version: "1.0"
+  description: >
+    A minimal, self-hosted, single-user personal finance ledger. No auth,
+    no UI, no aggregation, no filtering/pagination — a list endpoint
+    returns everything. See docs/spec-v1.md and CONTEXT.md for the
+    full domain model and rationale.
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+servers:
+  - url: http://127.0.0.1:8080
+security: []
+
+paths:
+  /currencies:
+    post:
+      summary: Create a currency
+      operationId: createCurrency
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code, minor_unit]
+              properties:
+                code:
+                  type: string
+                  description: ISO 4217 code, e.g. 'SEK', 'USD', 'EUR'
+                minor_unit:
+                  type: integer
+                  minimum: 0
+                  maximum: 4
+                  description: Decimal places (2 for USD, 0 for JPY)
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Currency"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+    get:
+      summary: List all currencies
+      operationId: listCurrencies
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Currency"
+
+  /accounts:
+    post:
+      summary: Create an account
+      operationId: createAccount
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, type]
+              properties:
+                name:
+                  type: string
+                type:
+                  type: string
+                  enum: [own, external]
+                currency_id:
+                  type: integer
+                  nullable: true
+                  description: >
+                    Required if type is 'own'; must be omitted/null if type
+                    is 'external' (enforced by the schema's CHECK).
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Account"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+    get:
+      summary: List all accounts
+      operationId: listAccounts
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Account"
+
+  /accounts/{id}:
+    delete:
+      summary: Delete an account
+      operationId: deleteAccount
+      parameters:
+        - $ref: "#/components/parameters/IntId"
+      responses:
+        "204":
+          description: Deleted
+        "400":
+          description: Account is still referenced by a transaction (native FK rejection)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /categories:
+    post:
+      summary: Create a category
+      operationId: createCategory
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Category"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+    get:
+      summary: List all categories
+      operationId: listCategories
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Category"
+
+  /categories/{id}:
+    delete:
+      summary: Delete a category
+      description: >
+        Referencing transactions have category_id set to NULL
+        (native, via ON DELETE SET NULL) — deletion is never blocked.
+      operationId: deleteCategory
+      parameters:
+        - $ref: "#/components/parameters/IntId"
+      responses:
+        "204":
+          description: Deleted
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /transactions:
+    post:
+      summary: Create a single transaction
+      description: Runs the shared cross-table validation function.
+      operationId: createTransaction
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TransactionCreate"
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Transaction"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+    get:
+      summary: List all transactions
+      description: Ordered by date DESC, id.
+      operationId: listTransactions
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Transaction"
+
+  /transactions/batch:
+    post:
+      summary: Create a batch of transactions
+      description: >
+        Every item shares the request's top-level batch_id (overriding any
+        batch_id in the item body) and is run through the same validation
+        function. The whole batch is one SQLite transaction: a single
+        invalid or duplicate row rolls back the entire batch.
+      operationId: createTransactionsBatch
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [batch_id, transactions]
+              properties:
+                batch_id:
+                  type: string
+                transactions:
+                  type: array
+                  items:
+                    $ref: "#/components/schemas/TransactionCreate"
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Transaction"
+        "400":
+          description: Validation failure on any item — the whole batch is rolled back
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: Duplicate id on any item — the whole batch is rolled back
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /transactions/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    patch:
+      summary: Update a transaction's description and/or category_id
+      description: >
+        Only description and category_id may be updated. amount, date,
+        account_id, opposing_account_id, batch_id, and id are immutable —
+        naming any of them in the request body is a 400, not a silent
+        no-op. Sets updated_at to now. category_id may be explicitly set
+        to null to clear it; omitting it leaves it unchanged.
+      operationId: patchTransaction
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                description:
+                  type: string
+                category_id:
+                  type: integer
+                  nullable: true
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Transaction"
+        "400":
+          description: Attempt to modify an immutable field
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      summary: Delete a transaction
+      operationId: deleteTransaction
+      responses:
+        "204":
+          description: Deleted
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+components:
+  parameters:
+    IntId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: integer
+
+  responses:
+    BadRequest:
+      description: Validation failure (including a CHECK/FK violation surfaced from SQLite)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: Unknown id
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Conflict:
+      description: Duplicate id on insert (primary-key conflict — the sole dedup mechanism)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+
+    Currency:
+      type: object
+      required: [id, code, minor_unit]
+      properties:
+        id:
+          type: integer
+        code:
+          type: string
+        minor_unit:
+          type: integer
+
+    Account:
+      type: object
+      required: [id, name, type, currency_id]
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        type:
+          type: string
+          enum: [own, external]
+        currency_id:
+          type: integer
+          nullable: true
+
+    Category:
+      type: object
+      required: [id, name]
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+
+    TransactionCreate:
+      type: object
+      required: [id, description, date, amount, account_id, opposing_account_id]
+      properties:
+        id:
+          type: string
+          description: Caller-supplied id (e.g. hash of bank id); sole dedup mechanism
+        batch_id:
+          type: string
+          nullable: true
+          description: >
+            Caller-supplied; groups an import for future bulk undo.
+            Ignored (overridden) inside a /transactions/batch item.
+        description:
+          type: string
+        date:
+          type: string
+        amount:
+          type: integer
+          description: Signed minor units, non-zero; positive = inflow to account_id
+        opposing_amount:
+          type: integer
+          nullable: true
+          description: >
+            Unsigned magnitude, required iff both accounts are 'own' with
+            differing currencies; otherwise must be omitted/null.
+        account_id:
+          type: integer
+          description: Must reference an account of type 'own'
+        opposing_account_id:
+          type: integer
+        category_id:
+          type: integer
+          nullable: true
+
+    Transaction:
+      allOf:
+        - $ref: "#/components/schemas/TransactionCreate"
+        - type: object
+          required: [created_at, updated_at]
+          properties:
+            created_at:
+              type: string
+            updated_at:
+              type: string
