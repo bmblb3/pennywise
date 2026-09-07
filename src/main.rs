@@ -21,6 +21,8 @@ CREATE TABLE accounts (
     )
 );
 
+CREATE UNIQUE INDEX accounts_name_type ON accounts (name, type);
+
 CREATE TABLE categories (
     id   INTEGER PRIMARY KEY,
     name TEXT NOT NULL UNIQUE
@@ -77,10 +79,16 @@ fn migrate(conn: &Connection) {
         0 => {
             conn.execute_batch(SCHEMA)
                 .expect("failed to apply schema");
-            conn.execute_batch("PRAGMA user_version = 1;")
+            conn.execute_batch("PRAGMA user_version = 2;")
                 .expect("failed to set user_version");
         }
-        1 => {}
+        1 => {
+            conn.execute_batch("CREATE UNIQUE INDEX accounts_name_type ON accounts (name, type);")
+                .expect("failed to add accounts_name_type index");
+            conn.execute_batch("PRAGMA user_version = 2;")
+                .expect("failed to set user_version");
+        }
+        2 => {}
         other => panic!("unknown database schema version: {other}"),
     }
 }
@@ -707,6 +715,23 @@ mod tests {
         assert_eq!(response.status_code().0, 201);
         let body = response_body(response);
         assert!(body.contains(r#"Bob \"Money\" Smith"#), "expected escaped name in {body}");
+    }
+
+    #[test]
+    fn duplicate_account_name_and_type_is_409() {
+        let conn = test_db();
+        let body = r#"{"name": "Dup", "type": "own", "currency_id": 1}"#;
+        assert_eq!(route(&conn, &Method::Post, "/accounts", body).status_code().0, 201);
+        assert_eq!(route(&conn, &Method::Post, "/accounts", body).status_code().0, 409);
+    }
+
+    #[test]
+    fn same_name_different_account_type_is_allowed() {
+        let conn = test_db();
+        let own = r#"{"name": "Shared", "type": "own", "currency_id": 1}"#;
+        let external = r#"{"name": "Shared", "type": "external"}"#;
+        assert_eq!(route(&conn, &Method::Post, "/accounts", own).status_code().0, 201);
+        assert_eq!(route(&conn, &Method::Post, "/accounts", external).status_code().0, 201);
     }
 
     #[test]
