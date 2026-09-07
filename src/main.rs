@@ -613,8 +613,17 @@ mod tests {
     fn setup() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
+        migrate(&conn);
         conn
+    }
+
+    #[test]
+    fn setup_applies_schema_through_migrate() {
+        let conn = setup();
+        let user_version: i64 = conn
+            .query_row("PRAGMA user_version;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(user_version, 2, "setup() must apply schema via migrate(), not duplicate SCHEMA directly");
     }
 
     #[test]
