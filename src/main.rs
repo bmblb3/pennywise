@@ -197,16 +197,63 @@ fn db_error_response(err: &rusqlite::Error) -> Response<Cursor<Vec<u8>>> {
 // it too and drop this hand-rolled parsing/escaping entirely. Deferred to
 // keep the escaping bugfix small; not done here.
 
+/// Un-escapes a JSON string body: `\"`, `\\`, `\n`/`\r`/`\t`, and `\uXXXX`
+/// (including surrogate pairs for characters outside the BMP).
+fn json_unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('u') => {
+                let hex: String = (&mut chars).take(4).collect();
+                let Ok(unit) = u32::from_str_radix(&hex, 16) else { continue };
+                let code_point = 'surrogate: {
+                    if !(0xD800..=0xDBFF).contains(&unit) {
+                        break 'surrogate unit;
+                    }
+                    // High surrogate: consume the expected `\uXXXX` low surrogate.
+                    let mut rest = chars.clone();
+                    if rest.next() != Some('\\') || rest.next() != Some('u') {
+                        break 'surrogate unit;
+                    }
+                    let low_hex: String = (&mut rest).take(4).collect();
+                    match u32::from_str_radix(&low_hex, 16) {
+                        Ok(low) if (0xDC00..=0xDFFF).contains(&low) => {
+                            chars = rest;
+                            0x10000 + (unit - 0xD800) * 0x400 + (low - 0xDC00)
+                        }
+                        _ => unit,
+                    }
+                };
+                if let Some(ch) = char::from_u32(code_point) {
+                    out.push(ch);
+                }
+            }
+            Some(other) => out.push(other),
+            None => {}
+        }
+    }
+    out
+}
+
 /// Extracts a top-level `"key": "value"` string field from a flat JSON
-/// object. No nesting, no unicode escapes — just enough for this API's
-/// request bodies.
+/// object. No nesting — just enough for this API's request bodies.
 fn json_str_field(body: &str, key: &str) -> Option<String> {
     let needle = format!("\"{key}\"");
     let after_key = &body[body.find(&needle)? + needle.len()..];
     let after_colon = after_key[after_key.find(':')? + 1..].trim_start();
     let rest = after_colon.strip_prefix('"')?;
     let end = rest.find('"')?;
-    Some(rest[..end].replace("\\\"", "\"").replace("\\\\", "\\"))
+    Some(json_unescape(&rest[..end]))
 }
 
 /// Extracts a top-level `"key": <integer>` field from a flat JSON object.
@@ -777,6 +824,20 @@ mod tests {
         let conn = test_db();
         let response = route(&conn, &Method::Post, "/accounts", r#"{"name": "New", "type": "own", "currency_id": 1}"#);
         assert_eq!(response.status_code().0, 201);
+    }
+
+    #[test]
+    fn create_account_decodes_unicode_escapes_in_name() {
+        let conn = test_db();
+        let response = route(
+            &conn,
+            &Method::Post,
+            "/accounts",
+            "{\"name\": \"\\u00f6\\u00e4\\u00e5\", \"type\": \"own\", \"currency_id\": 1}",
+        );
+        assert_eq!(response.status_code().0, 201);
+        let body = response_body(response);
+        assert!(body.contains('\u{f6}') && body.contains('\u{e4}') && body.contains('\u{e5}'), "expected decoded name in {body}");
     }
 
     #[test]
