@@ -125,7 +125,19 @@ fn validate_transaction(
 // delete, 400 validation failure, 404 unknown id, 409 duplicate id on insert.
 
 fn json_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn json_response(status: u16, body: String) -> Response<Cursor<Vec<u8>>> {
@@ -137,7 +149,8 @@ fn json_response(status: u16, body: String) -> Response<Cursor<Vec<u8>>> {
 
 /// `{"error": "<message>"}` envelope for any failure response.
 fn error_response(status: u16, message: &str) -> Response<Cursor<Vec<u8>>> {
-    json_response(status, format!(r#"{{"error": "{}"}}"#, json_escape(message)))
+    let body = serde_json::json!({ "error": message }).to_string();
+    json_response(status, body)
 }
 
 fn not_found() -> Response<Cursor<Vec<u8>>> {
@@ -178,6 +191,11 @@ fn db_error_response(err: &rusqlite::Error) -> Response<Cursor<Vec<u8>>> {
 // arbitrary JSON. A generic parser/serializer (or a serde dependency) would
 // be more code and more risk than reading the couple of fields each
 // endpoint actually needs. See /ponytail posture in CLAUDE.md.
+//
+// ponytail: now that serde_json is a dependency (for error_response's JSON
+// escaping), json_string/json_str_field/json_int_field below could move to
+// it too and drop this hand-rolled parsing/escaping entirely. Deferred to
+// keep the escaping bugfix small; not done here.
 
 /// Extracts a top-level `"key": "value"` string field from a flat JSON
 /// object. No nesting, no unicode escapes — just enough for this API's
@@ -887,6 +905,22 @@ mod tests {
             .unwrap_err();
         let response = db_error_response(&err);
         assert_eq!(response.status_code().0, 409);
+    }
+
+    #[test]
+    fn json_escape_handles_control_characters() {
+        let escaped = json_escape("CHECK constraint failed: (a) OR\n        (b)");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&format!("\"{escaped}\"")).unwrap();
+        assert_eq!(parsed, "CHECK constraint failed: (a) OR\n        (b)");
+    }
+
+    #[test]
+    fn error_response_with_embedded_newline_is_valid_json() {
+        let response = error_response(400, "CHECK constraint failed: (a) OR\n        (b)");
+        let body = response_body(response);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["error"], "CHECK constraint failed: (a) OR\n        (b)");
     }
 
     fn response_body(response: Response<Cursor<Vec<u8>>>) -> String {
