@@ -1,4 +1,5 @@
 use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 use tiny_http::{Header, Method, Response, Server};
 
@@ -124,22 +125,6 @@ fn validate_transaction(
 // envelope and status codes stay consistent: 201 create, 200 read, 204
 // delete, 400 validation failure, 404 unknown id, 409 duplicate id on insert.
 
-fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
 fn json_response(status: u16, body: String) -> Response<Cursor<Vec<u8>>> {
     let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
     Response::from_string(body)
@@ -184,204 +169,39 @@ fn db_error_response(err: &rusqlite::Error) -> Response<Cursor<Vec<u8>>> {
     error_response(status, &message)
 }
 
-// --- Minimal hand-rolled JSON -------------------------------------------
-//
-// Request/response bodies in this API are small, flat, fixed-shape objects
-// (a handful of string/int fields, or a list of such objects) — not
-// arbitrary JSON. A generic parser/serializer (or a serde dependency) would
-// be more code and more risk than reading the couple of fields each
-// endpoint actually needs. See /ponytail posture in CLAUDE.md.
-//
-// ponytail: now that serde_json is a dependency (for error_response's JSON
-// escaping), json_string/json_str_field/json_int_field below could move to
-// it too and drop this hand-rolled parsing/escaping entirely. Deferred to
-// keep the escaping bugfix small; not done here.
-
-/// Un-escapes a JSON string body: `\"`, `\\`, `\n`/`\r`/`\t`, and `\uXXXX`
-/// (including surrogate pairs for characters outside the BMP).
-fn json_unescape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('"') => out.push('"'),
-            Some('\\') => out.push('\\'),
-            Some('n') => out.push('\n'),
-            Some('r') => out.push('\r'),
-            Some('t') => out.push('\t'),
-            Some('u') => {
-                let hex: String = (&mut chars).take(4).collect();
-                let Ok(unit) = u32::from_str_radix(&hex, 16) else { continue };
-                let code_point = 'surrogate: {
-                    if !(0xD800..=0xDBFF).contains(&unit) {
-                        break 'surrogate unit;
-                    }
-                    // High surrogate: consume the expected `\uXXXX` low surrogate.
-                    let mut rest = chars.clone();
-                    if rest.next() != Some('\\') || rest.next() != Some('u') {
-                        break 'surrogate unit;
-                    }
-                    let low_hex: String = (&mut rest).take(4).collect();
-                    match u32::from_str_radix(&low_hex, 16) {
-                        Ok(low) if (0xDC00..=0xDFFF).contains(&low) => {
-                            chars = rest;
-                            0x10000 + (unit - 0xD800) * 0x400 + (low - 0xDC00)
-                        }
-                        _ => unit,
-                    }
-                };
-                if let Some(ch) = char::from_u32(code_point) {
-                    out.push(ch);
-                }
-            }
-            Some(other) => out.push(other),
-            None => {}
-        }
-    }
-    out
-}
-
-/// Extracts a top-level `"key": "value"` string field from a flat JSON
-/// object. No nesting — just enough for this API's request bodies.
-fn json_str_field(body: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\"");
-    let after_key = &body[body.find(&needle)? + needle.len()..];
-    let after_colon = after_key[after_key.find(':')? + 1..].trim_start();
-    let rest = after_colon.strip_prefix('"')?;
-    let end = rest.find('"')?;
-    Some(json_unescape(&rest[..end]))
-}
-
-/// Extracts a top-level `"key": <integer>` field from a flat JSON object.
-fn json_int_field(body: &str, key: &str) -> Option<i64> {
-    let needle = format!("\"{key}\"");
-    let after_key = &body[body.find(&needle)? + needle.len()..];
-    let after_colon = after_key[after_key.find(':')? + 1..].trim_start();
-    let end = after_colon
-        .find(|c: char| !(c.is_ascii_digit() || c == '-'))
-        .unwrap_or(after_colon.len());
-    after_colon[..end].parse().ok()
-}
-
-fn json_string(s: &str) -> String {
-    format!("\"{}\"", json_escape(s))
-}
-
-/// Whether a flat JSON object's *top level* names `key` at all (present with
-/// any value, including `null`) — distinct from `json_str_field`/
-/// `json_int_field`, which can't tell "absent" from "present but null/wrong
-/// type". Only matches a quoted string in key position (preceded by `{` or
-/// `,`, followed by `:`), so a field *value* that happens to contain the same
-/// text (e.g. `{"description": "amount"}`) isn't mistaken for the key.
-fn json_has_key(body: &str, key: &str) -> bool {
-    let needle = format!("\"{key}\"");
-    let mut from = 0;
-    while let Some(idx) = body[from..].find(&needle) {
-        let at = from + idx;
-        let before = body[..at].trim_end();
-        let after = body[at + needle.len()..].trim_start();
-        if (before.ends_with('{') || before.ends_with(',')) && after.starts_with(':') {
-            return true;
-        }
-        from = at + needle.len();
-    }
-    false
-}
-
-fn json_opt_int(v: Option<i64>) -> String {
-    v.map(|n| n.to_string()).unwrap_or_else(|| "null".to_string())
-}
-
-fn json_opt_string(v: Option<&str>) -> String {
-    v.map(json_string).unwrap_or_else(|| "null".to_string())
-}
-
-/// Splits out each top-level `{...}` object from a string, skipping over
-/// quoted strings so braces/brackets inside a description don't confuse the
-/// brace count. Used to pull the repeated transaction objects out of a
-/// `"transactions": [...]` array — the only nesting this API's request
-/// bodies need.
-fn split_json_objects(s: &str) -> Vec<String> {
-    let mut objects = Vec::new();
-    let mut depth = 0;
-    let mut start = 0;
-    let mut in_string = false;
-    let mut escaped = false;
-    for (i, c) in s.char_indices() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if c == '\\' {
-                escaped = true;
-            } else if c == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match c {
-            '"' => in_string = true,
-            '{' => {
-                if depth == 0 {
-                    start = i;
-                }
-                depth += 1;
-            }
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    objects.push(s[start..=i].to_string());
-                }
-            }
-            _ => {}
-        }
-    }
-    objects
-}
-
-/// Extracts a top-level `"key": [ {...}, {...} ]` field as the list of raw
-/// object bodies. No index into the array is needed by callers, so this
-/// skips finding the closing `]` and just collects every balanced `{...}`
-/// after the key — cheaper than tracking the array bound separately.
-fn json_object_array_field(body: &str, key: &str) -> Option<Vec<String>> {
-    let needle = format!("\"{key}\"");
-    let after_key = &body[body.find(&needle)? + needle.len()..];
-    let after_colon = &after_key[after_key.find(':')? + 1..];
-    let objects = split_json_objects(after_colon);
-    if objects.is_empty() {
-        None
-    } else {
-        Some(objects)
-    }
-}
-
 // --- Currencies ---------------------------------------------------------
 
-fn currency_json(row: &rusqlite::Row) -> rusqlite::Result<String> {
-    let id: i64 = row.get(0)?;
-    let code: String = row.get(1)?;
-    let minor_unit: i64 = row.get(2)?;
-    Ok(format!(
-        r#"{{"id": {id}, "code": {}, "minor_unit": {minor_unit}}}"#,
-        json_string(&code)
-    ))
+#[derive(Deserialize)]
+struct CreateCurrencyRequest {
+    code: String,
+    minor_unit: i64,
+}
+
+#[derive(Serialize)]
+struct CurrencyResponse {
+    id: i64,
+    code: String,
+    minor_unit: i64,
+}
+
+fn currency_json(row: &rusqlite::Row) -> rusqlite::Result<CurrencyResponse> {
+    Ok(CurrencyResponse {
+        id: row.get(0)?,
+        code: row.get(1)?,
+        minor_unit: row.get(2)?,
+    })
 }
 
 fn create_currency(conn: &Connection, body: &str) -> Response<Cursor<Vec<u8>>> {
-    let (Some(code), Some(minor_unit)) =
-        (json_str_field(body, "code"), json_int_field(body, "minor_unit"))
-    else {
+    let Ok(req) = serde_json::from_str::<CreateCurrencyRequest>(body) else {
         return error_response(400, "expected {code, minor_unit}");
     };
     match conn.query_row(
         "INSERT INTO currencies (code, minor_unit) VALUES (?1, ?2) RETURNING id, code, minor_unit",
-        rusqlite::params![code, minor_unit],
+        rusqlite::params![req.code, req.minor_unit],
         currency_json,
     ) {
-        Ok(json) => json_response(201, json),
+        Ok(row) => json_response(201, serde_json::to_string(&row).unwrap()),
         Err(err) => db_error_response(&err),
     }
 }
@@ -390,32 +210,44 @@ fn list_currencies(conn: &Connection) -> Response<Cursor<Vec<u8>>> {
     let mut stmt = conn
         .prepare("SELECT id, code, minor_unit FROM currencies")
         .expect("prepare list currencies");
-    let rows: Vec<String> = stmt
+    let rows: Vec<CurrencyResponse> = stmt
         .query_map([], currency_json)
         .expect("query currencies")
         .map(|r| r.expect("read currency row"))
         .collect();
-    json_response(200, format!("[{}]", rows.join(", ")))
+    json_response(200, serde_json::to_string(&rows).unwrap())
 }
 
 // --- Categories -----------------------------------------------------------
 
-fn category_json(row: &rusqlite::Row) -> rusqlite::Result<String> {
-    let id: i64 = row.get(0)?;
-    let name: String = row.get(1)?;
-    Ok(format!(r#"{{"id": {id}, "name": {}}}"#, json_string(&name)))
+#[derive(Deserialize)]
+struct CreateCategoryRequest {
+    name: String,
+}
+
+#[derive(Serialize)]
+struct CategoryResponse {
+    id: i64,
+    name: String,
+}
+
+fn category_json(row: &rusqlite::Row) -> rusqlite::Result<CategoryResponse> {
+    Ok(CategoryResponse {
+        id: row.get(0)?,
+        name: row.get(1)?,
+    })
 }
 
 fn create_category(conn: &Connection, body: &str) -> Response<Cursor<Vec<u8>>> {
-    let Some(name) = json_str_field(body, "name") else {
+    let Ok(req) = serde_json::from_str::<CreateCategoryRequest>(body) else {
         return error_response(400, "expected {name}");
     };
     match conn.query_row(
         "INSERT INTO categories (name) VALUES (?1) RETURNING id, name",
-        [name],
+        [req.name],
         category_json,
     ) {
-        Ok(json) => json_response(201, json),
+        Ok(row) => json_response(201, serde_json::to_string(&row).unwrap()),
         Err(err) => db_error_response(&err),
     }
 }
@@ -424,12 +256,12 @@ fn list_categories(conn: &Connection) -> Response<Cursor<Vec<u8>>> {
     let mut stmt = conn
         .prepare("SELECT id, name FROM categories")
         .expect("prepare list categories");
-    let rows: Vec<String> = stmt
+    let rows: Vec<CategoryResponse> = stmt
         .query_map([], category_json)
         .expect("query categories")
         .map(|r| r.expect("read category row"))
         .collect();
-    json_response(200, format!("[{}]", rows.join(", ")))
+    json_response(200, serde_json::to_string(&rows).unwrap())
 }
 
 fn delete_category(conn: &Connection, id: &str) -> Response<Cursor<Vec<u8>>> {
@@ -448,33 +280,41 @@ fn delete_category(conn: &Connection, id: &str) -> Response<Cursor<Vec<u8>>> {
 
 // --- Accounts handlers --------------------------------------------------
 
-fn account_json(row: &rusqlite::Row) -> rusqlite::Result<String> {
-    let id: i64 = row.get(0)?;
-    let name: String = row.get(1)?;
-    let r#type: String = row.get(2)?;
-    let currency_id: Option<i64> = row.get(3)?;
-    Ok(format!(
-        r#"{{"id": {id}, "name": {}, "type": {}, "currency_id": {}}}"#,
-        json_string(&name),
-        json_string(&r#type),
-        json_opt_int(currency_id),
-    ))
+#[derive(Deserialize)]
+struct CreateAccountRequest {
+    name: String,
+    r#type: String,
+    currency_id: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct AccountResponse {
+    id: i64,
+    name: String,
+    r#type: String,
+    currency_id: Option<i64>,
+}
+
+fn account_json(row: &rusqlite::Row) -> rusqlite::Result<AccountResponse> {
+    Ok(AccountResponse {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        r#type: row.get(2)?,
+        currency_id: row.get(3)?,
+    })
 }
 
 fn create_account(conn: &Connection, body: &str) -> Response<Cursor<Vec<u8>>> {
-    let (Some(name), Some(account_type)) =
-        (json_str_field(body, "name"), json_str_field(body, "type"))
-    else {
+    let Ok(req) = serde_json::from_str::<CreateAccountRequest>(body) else {
         return error_response(400, "expected {name, type}");
     };
-    let currency_id = json_int_field(body, "currency_id");
 
     match conn.query_row(
         "INSERT INTO accounts (name, type, currency_id) VALUES (?1, ?2, ?3) RETURNING id, name, type, currency_id",
-        rusqlite::params![name, account_type, currency_id],
+        rusqlite::params![req.name, req.r#type, req.currency_id],
         account_json,
     ) {
-        Ok(json) => json_response(201, json),
+        Ok(row) => json_response(201, serde_json::to_string(&row).unwrap()),
         Err(e) => db_error_response(&e),
     }
 }
@@ -483,12 +323,12 @@ fn list_accounts(conn: &Connection) -> Response<Cursor<Vec<u8>>> {
     let mut stmt = conn
         .prepare("SELECT id, name, type, currency_id FROM accounts")
         .expect("failed to prepare accounts query");
-    let rows: Vec<String> = stmt
+    let rows: Vec<AccountResponse> = stmt
         .query_map([], account_json)
         .expect("failed to query accounts")
         .map(|r| r.expect("failed to read account row"))
         .collect();
-    json_response(200, format!("[{}]", rows.join(", ")))
+    json_response(200, serde_json::to_string(&rows).unwrap())
 }
 
 fn delete_account(conn: &Connection, id: &str) -> Response<Cursor<Vec<u8>>> {
@@ -504,63 +344,71 @@ fn delete_account(conn: &Connection, id: &str) -> Response<Cursor<Vec<u8>>> {
 
 // --- Transactions handlers -----------------------------------------------
 
-fn transaction_json(row: &rusqlite::Row) -> rusqlite::Result<String> {
-    let id: String = row.get(0)?;
-    let batch_id: Option<String> = row.get(1)?;
-    let description: String = row.get(2)?;
-    let date: String = row.get(3)?;
-    let amount: i64 = row.get(4)?;
-    let opposing_amount: Option<i64> = row.get(5)?;
-    let account_id: i64 = row.get(6)?;
-    let opposing_account_id: i64 = row.get(7)?;
-    let category_id: Option<i64> = row.get(8)?;
-    let created_at: String = row.get(9)?;
-    let updated_at: String = row.get(10)?;
-    Ok(format!(
-        r#"{{"id": {}, "batch_id": {}, "description": {}, "date": {}, "amount": {amount}, "opposing_amount": {}, "account_id": {account_id}, "opposing_account_id": {opposing_account_id}, "category_id": {}, "created_at": {}, "updated_at": {}}}"#,
-        json_string(&id),
-        json_opt_string(batch_id.as_deref()),
-        json_string(&description),
-        json_string(&date),
-        json_opt_int(opposing_amount),
-        json_opt_int(category_id),
-        json_string(&created_at),
-        json_string(&updated_at),
-    ))
+#[derive(Deserialize)]
+struct CreateTransactionRequest {
+    id: String,
+    batch_id: Option<String>,
+    description: String,
+    date: String,
+    amount: i64,
+    opposing_amount: Option<i64>,
+    account_id: i64,
+    opposing_account_id: i64,
+    category_id: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct CreateTransactionsBatchRequest {
+    batch_id: String,
+    transactions: Vec<CreateTransactionRequest>,
+}
+
+#[derive(Serialize)]
+struct TransactionResponse {
+    id: String,
+    batch_id: Option<String>,
+    description: String,
+    date: String,
+    amount: i64,
+    opposing_amount: Option<i64>,
+    account_id: i64,
+    opposing_account_id: i64,
+    category_id: Option<i64>,
+    created_at: String,
+    updated_at: String,
+}
+
+fn transaction_json(row: &rusqlite::Row) -> rusqlite::Result<TransactionResponse> {
+    Ok(TransactionResponse {
+        id: row.get(0)?,
+        batch_id: row.get(1)?,
+        description: row.get(2)?,
+        date: row.get(3)?,
+        amount: row.get(4)?,
+        opposing_amount: row.get(5)?,
+        account_id: row.get(6)?,
+        opposing_account_id: row.get(7)?,
+        category_id: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+    })
 }
 
 const TRANSACTION_COLUMNS: &str = "id, batch_id, description, date, amount, opposing_amount, \
     account_id, opposing_account_id, category_id, created_at, updated_at";
 
 /// Shared by `POST /transactions` and each item of `POST /transactions/batch`.
-/// `forced_batch_id` overrides any `batch_id` in `body` — every row in a
+/// `forced_batch_id` overrides any `batch_id` on `req` — every row in a
 /// batch shares the request's top-level `batch_id`, regardless of what an
 /// individual item says.
 fn insert_transaction(
     conn: &Connection,
-    body: &str,
+    req: CreateTransactionRequest,
     forced_batch_id: Option<&str>,
-) -> Result<String, Response<Cursor<Vec<u8>>>> {
-    let (Some(id), Some(description), Some(date), Some(amount), Some(account_id), Some(opposing_account_id)) = (
-        json_str_field(body, "id"),
-        json_str_field(body, "description"),
-        json_str_field(body, "date"),
-        json_int_field(body, "amount"),
-        json_int_field(body, "account_id"),
-        json_int_field(body, "opposing_account_id"),
-    ) else {
-        return Err(error_response(
-            400,
-            "expected {id, description, date, amount, account_id, opposing_account_id}",
-        ));
-    };
-    let opposing_amount = json_int_field(body, "opposing_amount");
-    let category_id = json_int_field(body, "category_id");
-    let batch_id = forced_batch_id
-        .map(str::to_string)
-        .or_else(|| json_str_field(body, "batch_id"));
+) -> Result<TransactionResponse, Response<Cursor<Vec<u8>>>> {
+    let batch_id = forced_batch_id.map(str::to_string).or(req.batch_id);
 
-    if let Err(msg) = validate_transaction(conn, account_id, opposing_account_id, opposing_amount) {
+    if let Err(msg) = validate_transaction(conn, req.account_id, req.opposing_account_id, req.opposing_amount) {
         return Err(error_response(400, &msg));
     }
 
@@ -570,33 +418,36 @@ fn insert_transaction(
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              RETURNING {TRANSACTION_COLUMNS}"
         ),
-        rusqlite::params![id, batch_id, description, date, amount, opposing_amount, account_id, opposing_account_id, category_id],
+        rusqlite::params![req.id, batch_id, req.description, req.date, req.amount, req.opposing_amount, req.account_id, req.opposing_account_id, req.category_id],
         transaction_json,
     )
     .map_err(|e| db_error_response(&e))
 }
 
 fn create_transaction(conn: &Connection, body: &str) -> Response<Cursor<Vec<u8>>> {
-    match insert_transaction(conn, body, None) {
-        Ok(json) => json_response(201, json),
+    let Ok(req) = serde_json::from_str::<CreateTransactionRequest>(body) else {
+        return error_response(
+            400,
+            "expected {id, description, date, amount, account_id, opposing_account_id}",
+        );
+    };
+    match insert_transaction(conn, req, None) {
+        Ok(txn) => json_response(201, serde_json::to_string(&txn).unwrap()),
         Err(resp) => resp,
     }
 }
 
 fn create_transactions_batch(conn: &Connection, body: &str) -> Response<Cursor<Vec<u8>>> {
-    let (Some(batch_id), Some(items)) = (
-        json_str_field(body, "batch_id"),
-        json_object_array_field(body, "transactions"),
-    ) else {
+    let Ok(req) = serde_json::from_str::<CreateTransactionsBatchRequest>(body) else {
         return error_response(400, "expected {batch_id, transactions: [...]}");
     };
 
     conn.execute_batch("BEGIN").expect("begin batch transaction");
 
     let mut created = Vec::new();
-    for item in &items {
-        match insert_transaction(conn, item, Some(&batch_id)) {
-            Ok(json) => created.push(json),
+    for item in req.transactions {
+        match insert_transaction(conn, item, Some(&req.batch_id)) {
+            Ok(txn) => created.push(txn),
             Err(resp) => {
                 conn.execute_batch("ROLLBACK").expect("rollback batch transaction");
                 return resp;
@@ -605,7 +456,7 @@ fn create_transactions_batch(conn: &Connection, body: &str) -> Response<Cursor<V
     }
 
     conn.execute_batch("COMMIT").expect("commit batch transaction");
-    json_response(201, format!("[{}]", created.join(", ")))
+    json_response(201, serde_json::to_string(&created).unwrap())
 }
 
 fn list_transactions(conn: &Connection) -> Response<Cursor<Vec<u8>>> {
@@ -614,12 +465,12 @@ fn list_transactions(conn: &Connection) -> Response<Cursor<Vec<u8>>> {
             "SELECT {TRANSACTION_COLUMNS} FROM transactions ORDER BY date DESC, id"
         ))
         .expect("prepare list transactions");
-    let rows: Vec<String> = stmt
+    let rows: Vec<TransactionResponse> = stmt
         .query_map([], transaction_json)
         .expect("query transactions")
         .map(|r| r.expect("read transaction row"))
         .collect();
-    json_response(200, format!("[{}]", rows.join(", ")))
+    json_response(200, serde_json::to_string(&rows).unwrap())
 }
 
 /// Fields immutable after creation — naming any of these in a PATCH body is
@@ -628,19 +479,23 @@ const IMMUTABLE_TRANSACTION_FIELDS: [&str; 6] =
     ["amount", "date", "account_id", "opposing_account_id", "batch_id", "id"];
 
 fn patch_transaction(conn: &Connection, id: &str, body: &str) -> Response<Cursor<Vec<u8>>> {
+    let Ok(serde_json::Value::Object(fields)) = serde_json::from_str::<serde_json::Value>(body) else {
+        return error_response(400, "invalid JSON body");
+    };
+
     let names_immutable_field = IMMUTABLE_TRANSACTION_FIELDS
         .iter()
-        .any(|f| json_has_key(body, f));
+        .any(|f| fields.contains_key(*f));
     if names_immutable_field {
         return error_response(400, "only description and category_id may be updated");
     }
 
-    let description = json_str_field(body, "description");
+    let description = fields.get("description").and_then(|v| v.as_str());
     // category_id may be legitimately cleared to NULL, so "present" (even as
     // `null`) and "absent" need different SQL behavior — COALESCE alone can't
     // tell "leave unchanged" from "set to NULL".
-    let category_id_given = json_has_key(body, "category_id");
-    let category_id = json_int_field(body, "category_id");
+    let category_id_given = fields.contains_key("category_id");
+    let category_id = fields.get("category_id").and_then(|v| v.as_i64());
 
     let updated = conn.execute(
         "UPDATE transactions SET description = COALESCE(?1, description), \
@@ -656,7 +511,7 @@ fn patch_transaction(conn: &Connection, id: &str, body: &str) -> Response<Cursor
                 [id],
                 transaction_json,
             )
-            .map(|json| json_response(200, json))
+            .map(|row| json_response(200, serde_json::to_string(&row).unwrap()))
             .unwrap_or_else(|e| db_error_response(&e)),
         Err(e) => db_error_response(&e),
     }
@@ -841,6 +696,20 @@ mod tests {
     }
 
     #[test]
+    fn create_account_handles_escaped_quote_in_name() {
+        let conn = test_db();
+        let response = route(
+            &conn,
+            &Method::Post,
+            "/accounts",
+            r#"{"name": "Bob \"Money\" Smith", "type": "own", "currency_id": 1}"#,
+        );
+        assert_eq!(response.status_code().0, 201);
+        let body = response_body(response);
+        assert!(body.contains(r#"Bob \"Money\" Smith"#), "expected escaped name in {body}");
+    }
+
+    #[test]
     fn create_own_account_without_currency_is_400() {
         let conn = test_db();
         let response = route(&conn, &Method::Post, "/accounts", r#"{"name": "New", "type": "own"}"#);
@@ -969,14 +838,6 @@ mod tests {
     }
 
     #[test]
-    fn json_escape_handles_control_characters() {
-        let escaped = json_escape("CHECK constraint failed: (a) OR\n        (b)");
-        let parsed: serde_json::Value =
-            serde_json::from_str(&format!("\"{escaped}\"")).unwrap();
-        assert_eq!(parsed, "CHECK constraint failed: (a) OR\n        (b)");
-    }
-
-    #[test]
     fn error_response_with_embedded_newline_is_valid_json() {
         let response = error_response(400, "CHECK constraint failed: (a) OR\n        (b)");
         let body = response_body(response);
@@ -995,7 +856,7 @@ mod tests {
         let conn = test_db();
         let response = route(&conn, &Method::Post, "/transactions", TXN_BODY);
         assert_eq!(response.status_code().0, 201);
-        assert!(response_body(response).contains(r#""id": "t1""#));
+        assert!(response_body(response).contains(r#""id":"t1""#));
     }
 
     #[test]
@@ -1091,9 +952,9 @@ mod tests {
         let response = route(&conn, &Method::Get, "/transactions", "");
         assert_eq!(response.status_code().0, 200);
         let body = response_body(response);
-        let pos_a = body.find(r#""id": "a""#).unwrap();
-        let pos_b = body.find(r#""id": "b""#).unwrap();
-        let pos_c = body.find(r#""id": "c""#).unwrap();
+        let pos_a = body.find(r#""id":"a""#).unwrap();
+        let pos_b = body.find(r#""id":"b""#).unwrap();
+        let pos_c = body.find(r#""id":"c""#).unwrap();
         assert!(pos_b < pos_c && pos_c < pos_a, "expected order b, c, a but got: {body}");
     }
 
