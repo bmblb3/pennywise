@@ -596,11 +596,11 @@ struct PostingResponse {
     description: String,
     date: String,
     amount: f64,
-    currency_code: String,
-    account_name: String,
-    opposing_account_name: String,
+    currency: String,
+    account: String,
+    opposing_account: String,
     r#type: &'static str,
-    category_name: Option<String>,
+    category: Option<String>,
 }
 
 const POSTING_SELECT: &str = "SELECT t.description, t.date, t.amount, t.opposing_amount, \
@@ -642,11 +642,11 @@ fn push_postings(row: &rusqlite::Row, out: &mut Vec<PostingResponse>) -> rusqlit
         description: description.clone(),
         date: date.clone(),
         amount: major_amount,
-        currency_code,
-        account_name: account_name.clone(),
-        opposing_account_name: opposing_account_name.clone(),
+        currency: currency_code,
+        account: account_name.clone(),
+        opposing_account: opposing_account_name.clone(),
         r#type: primary_type,
-        category_name: category_name.clone(),
+        category: category_name.clone(),
     });
 
     if opposing_type == "own" {
@@ -659,11 +659,11 @@ fn push_postings(row: &rusqlite::Row, out: &mut Vec<PostingResponse>) -> rusqlit
             description,
             date,
             amount: opposing_major_amount,
-            currency_code: opposing_currency_code.expect("'own' account always has a currency"),
-            account_name: opposing_account_name,
-            opposing_account_name: account_name,
+            currency: opposing_currency_code.expect("'own' account always has a currency"),
+            account: opposing_account_name,
+            opposing_account: account_name,
             r#type: "Transfer",
-            category_name,
+            category: category_name,
         });
     }
 
@@ -1344,8 +1344,8 @@ mod tests {
         assert_eq!(postings.len(), 1, "external counterparty must not get its own posting row");
         assert_eq!(postings[0]["type"], "Withdrawal");
         assert_eq!(postings[0]["amount"], -5.0);
-        assert_eq!(postings[0]["account_name"], "Own SEK A");
-        assert_eq!(postings[0]["opposing_account_name"], "External");
+        assert_eq!(postings[0]["account"], "Own SEK A");
+        assert_eq!(postings[0]["opposing_account"], "External");
     }
 
     #[test]
@@ -1362,15 +1362,15 @@ mod tests {
         let postings = postings.as_array().unwrap();
         assert_eq!(postings.len(), 2);
 
-        let from = postings.iter().find(|p| p["account_name"] == "Own SEK A").unwrap();
+        let from = postings.iter().find(|p| p["account"] == "Own SEK A").unwrap();
         assert_eq!(from["amount"], -10.0);
         assert_eq!(from["type"], "Transfer");
-        assert_eq!(from["opposing_account_name"], "Own SEK B");
+        assert_eq!(from["opposing_account"], "Own SEK B");
 
-        let to = postings.iter().find(|p| p["account_name"] == "Own SEK B").unwrap();
+        let to = postings.iter().find(|p| p["account"] == "Own SEK B").unwrap();
         assert_eq!(to["amount"], 10.0);
         assert_eq!(to["type"], "Transfer");
-        assert_eq!(to["opposing_account_name"], "Own SEK A");
+        assert_eq!(to["opposing_account"], "Own SEK A");
     }
 
     #[test]
@@ -1388,12 +1388,12 @@ mod tests {
         let postings = postings.as_array().unwrap();
         assert_eq!(postings.len(), 2);
 
-        let from = postings.iter().find(|p| p["account_name"] == "Own SEK A").unwrap();
+        let from = postings.iter().find(|p| p["account"] == "Own SEK A").unwrap();
         assert_eq!(from["amount"], -5.0);
-        assert_eq!(from["currency_code"], "SEK");
+        assert_eq!(from["currency"], "SEK");
 
-        let to = postings.iter().find(|p| p["account_name"] == "Own USD").unwrap();
+        let to = postings.iter().find(|p| p["account"] == "Own USD").unwrap();
         assert_eq!(to["amount"], 5.0);
-        assert_eq!(to["currency_code"], "USD");
+        assert_eq!(to["currency"], "USD");
     }
 }

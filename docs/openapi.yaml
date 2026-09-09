@@ -456,7 +456,7 @@ components:
 
     Posting:
       type: object
-      required: [description, date, amount, currency_code, account_name, opposing_account_name, type, category_name]
+      required: [description, date, amount, currency, account, opposing_account, type, category]
       properties:
         description:
           type: string
@@ -464,12 +464,12 @@ components:
           type: string
         amount:
           type: number
-          description: Major units, signed from this row's account_name's perspective.
-        currency_code:
+          description: Major units, signed from this row's account's perspective.
+        currency:
           type: string
-        account_name:
+        account:
           type: string
-        opposing_account_name:
+        opposing_account:
           type: string
         type:
           type: string
@@ -477,6 +477,6 @@ components:
           description: >
             Transfer when the opposing account is also 'own'; otherwise
             Deposit (amount > 0) or Withdrawal (amount < 0).
-        category_name:
+        category:
           type: string
           nullable: true
