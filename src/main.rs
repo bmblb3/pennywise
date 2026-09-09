@@ -97,6 +97,21 @@ fn migrate(conn: &Connection) {
 /// path must call (see docs/spec-v1.md "Cross-table validation"). Everything else
 /// (id existence, own-account-has-currency, external-account-has-no-currency) is
 /// already enforced by the schema's CHECK/REFERENCES + PRAGMA foreign_keys = ON.
+// ponytail: format check only (no calendar validity, e.g. accepts month 13) — swap for
+// `chrono::DateTime::parse_from_rfc3339` if that gap ever bites.
+fn is_rfc3339(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let digit = |i: usize| bytes.get(i).is_some_and(u8::is_ascii_digit);
+    bytes.len() >= 20
+        && (0..4).all(digit) && bytes[4] == b'-'
+        && (5..7).all(digit) && bytes[7] == b'-'
+        && (8..10).all(digit) && (bytes[10] == b'T' || bytes[10] == b't')
+        && (11..13).all(digit) && bytes[13] == b':'
+        && (14..16).all(digit) && bytes[16] == b':'
+        && (17..19).all(digit)
+        && (bytes[19] == b'Z' || bytes[19] == b'z' || bytes[19] == b'+' || bytes[19] == b'-')
+}
+
 fn validate_transaction(
     conn: &Connection,
     account_id: i64,
@@ -419,6 +434,9 @@ fn insert_transaction(
     if let Err(msg) = validate_transaction(conn, req.account_id, req.opposing_account_id, req.opposing_amount) {
         return Err(error_response(400, &msg));
     }
+    if !is_rfc3339(&req.date) {
+        return Err(error_response(400, "date must be RFC3339, e.g. 2026-09-02T15:45:46+02:00"));
+    }
 
     conn.query_row(
         &format!(
@@ -589,6 +607,14 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rfc3339_validation() {
+        assert!(is_rfc3339("2026-09-02T15:45:46+02:00"));
+        assert!(is_rfc3339("2026-09-02T15:45:46Z"));
+        assert!(!is_rfc3339("2026-09-02"));
+        assert!(!is_rfc3339("not a date"));
+    }
 
     /// Sets up an in-memory DB with two currencies (SEK id 1, USD id 2) and four
     /// accounts: 1 = own/SEK, 2 = own/SEK, 3 = own/USD, 4 = external.
@@ -883,7 +909,7 @@ mod tests {
         String::from_utf8(response.into_reader().into_inner()).unwrap()
     }
 
-    const TXN_BODY: &str = r#"{"id": "t1", "description": "Coffee", "date": "2024-01-01", "amount": -500, "account_id": 1, "opposing_account_id": 4}"#;
+    const TXN_BODY: &str = r#"{"id": "t1", "description": "Coffee", "date": "2024-01-01T12:00:00Z", "amount": -500, "account_id": 1, "opposing_account_id": 4}"#;
 
     #[test]
     fn create_transaction_returns_201_with_row() {
@@ -897,7 +923,7 @@ mod tests {
     fn create_transaction_validation_failure_is_400() {
         let conn = test_db();
         // account_id must be 'own'; account 4 is 'external'.
-        let body = r#"{"id": "t1", "description": "Coffee", "date": "2024-01-01", "amount": -500, "account_id": 4, "opposing_account_id": 1}"#;
+        let body = r#"{"id": "t1", "description": "Coffee", "date": "2024-01-01T12:00:00Z", "amount": -500, "account_id": 4, "opposing_account_id": 1}"#;
         let response = route(&conn, &Method::Post, "/transactions", body);
         assert_eq!(response.status_code().0, 400);
 
@@ -918,8 +944,8 @@ mod tests {
         let body = r#"{
             "batch_id": "b1",
             "transactions": [
-                {"id": "t1", "description": "Coffee", "date": "2024-01-01", "amount": -500, "account_id": 1, "opposing_account_id": 4},
-                {"id": "t2", "description": "Lunch", "date": "2024-01-02", "amount": -1000, "account_id": 1, "opposing_account_id": 4}
+                {"id": "t1", "description": "Coffee", "date": "2024-01-01T12:00:00Z", "amount": -500, "account_id": 1, "opposing_account_id": 4},
+                {"id": "t2", "description": "Lunch", "date": "2024-01-02T12:00:00Z", "amount": -1000, "account_id": 1, "opposing_account_id": 4}
             ]
         }"#;
         let response = route(&conn, &Method::Post, "/transactions/batch", body);
@@ -937,8 +963,8 @@ mod tests {
         let body = r#"{
             "batch_id": "b1",
             "transactions": [
-                {"id": "t1", "description": "Coffee", "date": "2024-01-01", "amount": -500, "account_id": 1, "opposing_account_id": 4},
-                {"id": "t2", "description": "Bad", "date": "2024-01-02", "amount": -1000, "account_id": 4, "opposing_account_id": 1}
+                {"id": "t1", "description": "Coffee", "date": "2024-01-01T12:00:00Z", "amount": -500, "account_id": 1, "opposing_account_id": 4},
+                {"id": "t2", "description": "Bad", "date": "2024-01-02T12:00:00Z", "amount": -1000, "account_id": 4, "opposing_account_id": 1}
             ]
         }"#;
         let response = route(&conn, &Method::Post, "/transactions/batch", body);
@@ -959,8 +985,8 @@ mod tests {
         let body = r#"{
             "batch_id": "b1",
             "transactions": [
-                {"id": "t2", "description": "Coffee", "date": "2024-01-02", "amount": -500, "account_id": 1, "opposing_account_id": 4},
-                {"id": "t1", "description": "Dup", "date": "2024-01-03", "amount": -1000, "account_id": 1, "opposing_account_id": 4}
+                {"id": "t2", "description": "Coffee", "date": "2024-01-02T12:00:00Z", "amount": -500, "account_id": 1, "opposing_account_id": 4},
+                {"id": "t1", "description": "Dup", "date": "2024-01-03T12:00:00Z", "amount": -1000, "account_id": 1, "opposing_account_id": 4}
             ]
         }"#;
         let response = route(&conn, &Method::Post, "/transactions/batch", body);
