@@ -2,6 +2,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 use tiny_http::{Header, Method, Response, Server};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 const SCHEMA: &str = "
 CREATE TABLE currencies (
@@ -79,16 +80,10 @@ fn migrate(conn: &Connection) {
         0 => {
             conn.execute_batch(SCHEMA)
                 .expect("failed to apply schema");
-            conn.execute_batch("PRAGMA user_version = 2;")
+            conn.execute_batch("PRAGMA user_version = 1;")
                 .expect("failed to set user_version");
         }
-        1 => {
-            conn.execute_batch("CREATE UNIQUE INDEX accounts_name_type ON accounts (name, type);")
-                .expect("failed to add accounts_name_type index");
-            conn.execute_batch("PRAGMA user_version = 2;")
-                .expect("failed to set user_version");
-        }
-        2 => {}
+        1 => {}
         other => panic!("unknown database schema version: {other}"),
     }
 }
@@ -97,19 +92,8 @@ fn migrate(conn: &Connection) {
 /// path must call (see docs/spec-v1.md "Cross-table validation"). Everything else
 /// (id existence, own-account-has-currency, external-account-has-no-currency) is
 /// already enforced by the schema's CHECK/REFERENCES + PRAGMA foreign_keys = ON.
-// ponytail: format check only (no calendar validity, e.g. accepts month 13) — swap for
-// `chrono::DateTime::parse_from_rfc3339` if that gap ever bites.
 fn is_rfc3339(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    let digit = |i: usize| bytes.get(i).is_some_and(u8::is_ascii_digit);
-    bytes.len() >= 20
-        && (0..4).all(digit) && bytes[4] == b'-'
-        && (5..7).all(digit) && bytes[7] == b'-'
-        && (8..10).all(digit) && (bytes[10] == b'T' || bytes[10] == b't')
-        && (11..13).all(digit) && bytes[13] == b':'
-        && (14..16).all(digit) && bytes[16] == b':'
-        && (17..19).all(digit)
-        && (bytes[19] == b'Z' || bytes[19] == b'z' || bytes[19] == b'+' || bytes[19] == b'-')
+    OffsetDateTime::parse(s, &Rfc3339).is_ok()
 }
 
 /// The `minor_unit` of the currency backing `account_id`, e.g. `2` for a SEK
@@ -662,6 +646,7 @@ mod tests {
         assert!(is_rfc3339("2026-09-02T15:45:46Z"));
         assert!(!is_rfc3339("2026-09-02"));
         assert!(!is_rfc3339("not a date"));
+        assert!(!is_rfc3339("2026-13-01T00:00:00Z"), "month 13 is not a valid calendar date");
     }
 
     /// Sets up an in-memory DB with two currencies (SEK id 1, USD id 2) and four
@@ -697,7 +682,7 @@ mod tests {
         let user_version: i64 = conn
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(user_version, 2, "setup() must apply schema via migrate(), not duplicate SCHEMA directly");
+        assert_eq!(user_version, 1, "setup() must apply schema via migrate(), not duplicate SCHEMA directly");
     }
 
     #[test]
