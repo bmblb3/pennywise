@@ -6,3 +6,4 @@ docs/openapi.yaml:
     - '#/paths/~1accounts/get/responses'
     - '#/paths/~1categories/get/responses'
     - '#/paths/~1transactions/get/responses'
+    - '#/paths/~1postings/get/responses'

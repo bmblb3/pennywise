@@ -583,6 +583,105 @@ fn delete_transaction(conn: &Connection, id: &str) -> Response<Cursor<Vec<u8>>> 
     }
 }
 
+// --- Postings ---------------------------------------------------------------
+//
+// A flat, self-contained double-entry view for downstream aggregation (jq
+// balances/expenses/income by account/category/date/sign) without any
+// server-side filtering: each transaction becomes one row per *tracked* (own)
+// account it touches, already correctly signed and named, so no client-side
+// sign inference or id-joining is needed.
+
+#[derive(Serialize)]
+struct PostingResponse {
+    description: String,
+    date: String,
+    amount: f64,
+    currency_code: String,
+    account_name: String,
+    opposing_account_name: String,
+    r#type: &'static str,
+    category_name: Option<String>,
+}
+
+const POSTING_SELECT: &str = "SELECT t.description, t.date, t.amount, t.opposing_amount, \
+    a.name, ac.code, ac.minor_unit, \
+    oa.name, oa.type, oc.code, oc.minor_unit, \
+    cat.name \
+    FROM transactions t \
+    JOIN accounts a ON t.account_id = a.id JOIN currencies ac ON a.currency_id = ac.id \
+    JOIN accounts oa ON t.opposing_account_id = oa.id LEFT JOIN currencies oc ON oa.currency_id = oc.id \
+    LEFT JOIN categories cat ON t.category_id = cat.id";
+
+/// Reads one joined `POSTING_SELECT` row and appends 1 or 2 `PostingResponse`s
+/// to `out`: always the primary leg (`account_id` is always 'own'), plus the
+/// opposing leg only when the opposing account is also 'own' — an external
+/// counterparty isn't a balance anyone tracks, so it gets no row of its own.
+fn push_postings(row: &rusqlite::Row, out: &mut Vec<PostingResponse>) -> rusqlite::Result<()> {
+    let description: String = row.get(0)?;
+    let date: String = row.get(1)?;
+    let amount: i64 = row.get(2)?;
+    let opposing_amount: Option<i64> = row.get(3)?;
+    let account_name: String = row.get(4)?;
+    let currency_code: String = row.get(5)?;
+    let minor_unit: i64 = row.get(6)?;
+    let opposing_account_name: String = row.get(7)?;
+    let opposing_type: String = row.get(8)?;
+    let opposing_currency_code: Option<String> = row.get(9)?;
+    let opposing_minor_unit: Option<i64> = row.get(10)?;
+    let category_name: Option<String> = row.get(11)?;
+
+    let major_amount = minor_to_major(amount, minor_unit);
+    let primary_type = if opposing_type == "own" {
+        "Transfer"
+    } else if major_amount > 0.0 {
+        "Deposit"
+    } else {
+        "Withdrawal"
+    };
+    out.push(PostingResponse {
+        description: description.clone(),
+        date: date.clone(),
+        amount: major_amount,
+        currency_code,
+        account_name: account_name.clone(),
+        opposing_account_name: opposing_account_name.clone(),
+        r#type: primary_type,
+        category_name: category_name.clone(),
+    });
+
+    if opposing_type == "own" {
+        let opposing_minor_unit = opposing_minor_unit.expect("'own' account always has a currency");
+        let opposing_major_amount = match opposing_amount {
+            Some(a) => minor_to_major(if amount < 0 { a } else { -a }, opposing_minor_unit),
+            None => minor_to_major(-amount, minor_unit),
+        };
+        out.push(PostingResponse {
+            description,
+            date,
+            amount: opposing_major_amount,
+            currency_code: opposing_currency_code.expect("'own' account always has a currency"),
+            account_name: opposing_account_name,
+            opposing_account_name: account_name,
+            r#type: "Transfer",
+            category_name,
+        });
+    }
+
+    Ok(())
+}
+
+fn list_postings(conn: &Connection) -> Response<Cursor<Vec<u8>>> {
+    let mut stmt = conn
+        .prepare(&format!("{POSTING_SELECT} ORDER BY t.date DESC, t.id"))
+        .expect("prepare list postings");
+    let mut rows = stmt.query([]).expect("query postings");
+    let mut postings = Vec::new();
+    while let Some(row) = rows.next().expect("read posting row") {
+        push_postings(row, &mut postings).expect("map posting row");
+    }
+    json_response(200, serde_json::to_string(&postings).unwrap())
+}
+
 // --- Routing ----------------------------------------------------------------
 //
 // Dispatch skeleton: matches method + path against the known resource
@@ -612,6 +711,8 @@ fn route(conn: &Connection, method: &Method, path: &str, body: &str) -> Response
         (Method::Get, ["transactions"]) => list_transactions(conn),
         (Method::Patch, ["transactions", id]) => patch_transaction(conn, id, body),
         (Method::Delete, ["transactions", id]) => delete_transaction(conn, id),
+
+        (Method::Get, ["postings"]) => list_postings(conn),
 
         _ => not_found(),
     }
@@ -1229,5 +1330,70 @@ mod tests {
         let conn = test_db();
         let response = route(&conn, &Method::Delete, "/transactions/nope", "");
         assert_eq!(response.status_code().0, 404);
+    }
+
+    #[test]
+    fn own_to_external_produces_one_posting_typed_by_sign() {
+        let conn = test_db();
+        route(&conn, &Method::Post, "/transactions", TXN_BODY); // -5.00 from account 1 to external account 4
+        let response = route(&conn, &Method::Get, "/postings", "");
+        assert_eq!(response.status_code().0, 200);
+        let body = response_body(response);
+        let postings: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let postings = postings.as_array().unwrap();
+        assert_eq!(postings.len(), 1, "external counterparty must not get its own posting row");
+        assert_eq!(postings[0]["type"], "Withdrawal");
+        assert_eq!(postings[0]["amount"], -5.0);
+        assert_eq!(postings[0]["account_name"], "Own SEK A");
+        assert_eq!(postings[0]["opposing_account_name"], "External");
+    }
+
+    #[test]
+    fn own_to_own_same_currency_transfer_produces_two_postings() {
+        let conn = test_db();
+        conn.execute(
+            "INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id) VALUES ('t1', 'Move', '2024-01-01', -1000, 1, 2)",
+            [],
+        )
+        .unwrap();
+
+        let response = route(&conn, &Method::Get, "/postings", "");
+        let postings: serde_json::Value = serde_json::from_str(&response_body(response)).unwrap();
+        let postings = postings.as_array().unwrap();
+        assert_eq!(postings.len(), 2);
+
+        let from = postings.iter().find(|p| p["account_name"] == "Own SEK A").unwrap();
+        assert_eq!(from["amount"], -10.0);
+        assert_eq!(from["type"], "Transfer");
+        assert_eq!(from["opposing_account_name"], "Own SEK B");
+
+        let to = postings.iter().find(|p| p["account_name"] == "Own SEK B").unwrap();
+        assert_eq!(to["amount"], 10.0);
+        assert_eq!(to["type"], "Transfer");
+        assert_eq!(to["opposing_account_name"], "Own SEK A");
+    }
+
+    #[test]
+    fn cross_currency_transfer_converts_each_leg_via_its_own_currency() {
+        let conn = test_db();
+        conn.execute(
+            "INSERT INTO transactions (id, description, date, amount, opposing_amount, account_id, opposing_account_id) \
+             VALUES ('t1', 'FX transfer', '2024-01-01', -500, 500, 1, 3)",
+            [],
+        )
+        .unwrap();
+
+        let response = route(&conn, &Method::Get, "/postings", "");
+        let postings: serde_json::Value = serde_json::from_str(&response_body(response)).unwrap();
+        let postings = postings.as_array().unwrap();
+        assert_eq!(postings.len(), 2);
+
+        let from = postings.iter().find(|p| p["account_name"] == "Own SEK A").unwrap();
+        assert_eq!(from["amount"], -5.0);
+        assert_eq!(from["currency_code"], "SEK");
+
+        let to = postings.iter().find(|p| p["account_name"] == "Own USD").unwrap();
+        assert_eq!(to["amount"], 5.0);
+        assert_eq!(to["currency_code"], "USD");
     }
 }

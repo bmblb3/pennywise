@@ -308,6 +308,29 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
+  /postings:
+    get:
+      summary: List postings — a flat, self-contained double-entry view
+      description: >
+        Each transaction becomes one row per 'own' account it touches,
+        already correctly signed and carrying denormalized names/currency,
+        so a client can filter and aggregate (e.g. with jq) by
+        account_name, category_name, date, or sign without any joins or
+        sign inference. An external counterparty gets no row of its own —
+        it's never a tracked balance — so an own-to-external transaction
+        yields exactly one posting, while an own-to-own transfer yields
+        two (one per account). Ordered by date DESC, id.
+      operationId: listPostings
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Posting"
+
 components:
   parameters:
     IntId:
@@ -430,3 +453,30 @@ components:
               type: string
             updated_at:
               type: string
+
+    Posting:
+      type: object
+      required: [description, date, amount, currency_code, account_name, opposing_account_name, type, category_name]
+      properties:
+        description:
+          type: string
+        date:
+          type: string
+        amount:
+          type: number
+          description: Major units, signed from this row's account_name's perspective.
+        currency_code:
+          type: string
+        account_name:
+          type: string
+        opposing_account_name:
+          type: string
+        type:
+          type: string
+          enum: [Transfer, Deposit, Withdrawal]
+          description: >
+            Transfer when the opposing account is also 'own'; otherwise
+            Deposit (amount > 0) or Withdrawal (amount < 0).
+        category_name:
+          type: string
+          nullable: true
