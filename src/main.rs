@@ -112,6 +112,35 @@ fn is_rfc3339(s: &str) -> bool {
         && (bytes[19] == b'Z' || bytes[19] == b'z' || bytes[19] == b'+' || bytes[19] == b'-')
 }
 
+/// The `minor_unit` of the currency backing `account_id`, e.g. `2` for a SEK
+/// account. Errors (rather than returning an implicit default) if the account
+/// doesn't exist or has no currency, since that also means it can't be 'own'.
+fn account_minor_unit(conn: &Connection, account_id: i64) -> Result<i64, String> {
+    conn.query_row(
+        "SELECT c.minor_unit FROM accounts a JOIN currencies c ON a.currency_id = c.id WHERE a.id = ?1",
+        [account_id],
+        |row| row.get(0),
+    )
+    .map_err(|_| format!("account {account_id} does not exist or has no currency"))
+}
+
+/// Converts a REST-facing major-unit amount (e.g. `12.34`) to the minor-unit
+/// integer stored in the DB (e.g. `1234`), rejecting precision the currency
+/// doesn't support. `1e-6` absorbs `f64` representation noise (`19.99 * 100`
+/// isn't exactly `1999.0`) without accepting genuine extra decimal places.
+fn major_to_minor(major: f64, minor_unit: i64) -> Result<i64, String> {
+    let scaled = major * 10f64.powi(minor_unit as i32);
+    let rounded = scaled.round();
+    if (scaled - rounded).abs() > 1e-6 {
+        return Err(format!("amount has more precision than the currency's {minor_unit} decimal places"));
+    }
+    Ok(rounded as i64)
+}
+
+fn minor_to_major(minor: i64, minor_unit: i64) -> f64 {
+    minor as f64 / 10f64.powi(minor_unit as i32)
+}
+
 fn validate_transaction(
     conn: &Connection,
     account_id: i64,
@@ -373,8 +402,8 @@ struct CreateTransactionRequest {
     batch_id: Option<String>,
     description: String,
     date: String,
-    amount: i64,
-    opposing_amount: Option<i64>,
+    amount: f64,
+    opposing_amount: Option<f64>,
     account_id: i64,
     opposing_account_id: i64,
     category_id: Option<i64>,
@@ -392,8 +421,8 @@ struct TransactionResponse {
     batch_id: Option<String>,
     description: String,
     date: String,
-    amount: i64,
-    opposing_amount: Option<i64>,
+    amount: f64,
+    opposing_amount: Option<f64>,
     account_id: i64,
     opposing_account_id: i64,
     category_id: Option<i64>,
@@ -401,14 +430,23 @@ struct TransactionResponse {
     updated_at: String,
 }
 
+/// Reads a joined `TRANSACTION_SELECT` row: the raw minor-unit amounts plus
+/// the two extra `minor_unit` columns the join adds, converting to
+/// REST-facing major units here so every read path (insert/list/patch) goes
+/// through one place.
 fn transaction_json(row: &rusqlite::Row) -> rusqlite::Result<TransactionResponse> {
+    let amount: i64 = row.get(4)?;
+    let opposing_amount: Option<i64> = row.get(5)?;
+    let account_minor_unit: i64 = row.get(11)?;
+    let opposing_minor_unit: Option<i64> = row.get(12)?;
     Ok(TransactionResponse {
         id: row.get(0)?,
         batch_id: row.get(1)?,
         description: row.get(2)?,
         date: row.get(3)?,
-        amount: row.get(4)?,
-        opposing_amount: row.get(5)?,
+        amount: minor_to_major(amount, account_minor_unit),
+        opposing_amount: opposing_amount
+            .map(|a| minor_to_major(a, opposing_minor_unit.expect("opposing_amount implies an opposing currency"))),
         account_id: row.get(6)?,
         opposing_account_id: row.get(7)?,
         category_id: row.get(8)?,
@@ -417,8 +455,14 @@ fn transaction_json(row: &rusqlite::Row) -> rusqlite::Result<TransactionResponse
     })
 }
 
-const TRANSACTION_COLUMNS: &str = "id, batch_id, description, date, amount, opposing_amount, \
-    account_id, opposing_account_id, category_id, created_at, updated_at";
+/// `transaction_json` reader, joined to both legs' currencies so their
+/// `minor_unit` is available for the minor→major conversion at read time.
+const TRANSACTION_SELECT: &str = "SELECT t.id, t.batch_id, t.description, t.date, t.amount, t.opposing_amount, \
+    t.account_id, t.opposing_account_id, t.category_id, t.created_at, t.updated_at, \
+    ac.minor_unit, oc.minor_unit \
+    FROM transactions t \
+    JOIN accounts a ON t.account_id = a.id JOIN currencies ac ON a.currency_id = ac.id \
+    JOIN accounts oa ON t.opposing_account_id = oa.id LEFT JOIN currencies oc ON oa.currency_id = oc.id";
 
 /// Shared by `POST /transactions` and each item of `POST /transactions/batch`.
 /// `forced_batch_id` overrides any `batch_id` on `req` — every row in a
@@ -431,23 +475,33 @@ fn insert_transaction(
 ) -> Result<TransactionResponse, Response<Cursor<Vec<u8>>>> {
     let batch_id = forced_batch_id.map(str::to_string).or(req.batch_id);
 
-    if let Err(msg) = validate_transaction(conn, req.account_id, req.opposing_account_id, req.opposing_amount) {
+    let minor_unit = account_minor_unit(conn, req.account_id).map_err(|e| error_response(400, &e))?;
+    let amount = major_to_minor(req.amount, minor_unit).map_err(|e| error_response(400, &e))?;
+    let opposing_amount = req
+        .opposing_amount
+        .map(|a| {
+            let opposing_minor_unit = account_minor_unit(conn, req.opposing_account_id)?;
+            major_to_minor(a, opposing_minor_unit)
+        })
+        .transpose()
+        .map_err(|e| error_response(400, &e))?;
+
+    if let Err(msg) = validate_transaction(conn, req.account_id, req.opposing_account_id, opposing_amount) {
         return Err(error_response(400, &msg));
     }
     if !is_rfc3339(&req.date) {
         return Err(error_response(400, "date must be RFC3339, e.g. 2026-09-02T15:45:46+02:00"));
     }
 
-    conn.query_row(
-        &format!(
-            "INSERT INTO transactions (id, batch_id, description, date, amount, opposing_amount, account_id, opposing_account_id, category_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-             RETURNING {TRANSACTION_COLUMNS}"
-        ),
-        rusqlite::params![req.id, batch_id, req.description, req.date, req.amount, req.opposing_amount, req.account_id, req.opposing_account_id, req.category_id],
-        transaction_json,
+    conn.execute(
+        "INSERT INTO transactions (id, batch_id, description, date, amount, opposing_amount, account_id, opposing_account_id, category_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        rusqlite::params![req.id, batch_id, req.description, req.date, amount, opposing_amount, req.account_id, req.opposing_account_id, req.category_id],
     )
-    .map_err(|e| db_error_response(&e))
+    .map_err(|e| db_error_response(&e))?;
+
+    conn.query_row(&format!("{TRANSACTION_SELECT} WHERE t.id = ?1"), [&req.id], transaction_json)
+        .map_err(|e| db_error_response(&e))
 }
 
 fn create_transaction(conn: &Connection, body: &str) -> Response<Cursor<Vec<u8>>> {
@@ -487,9 +541,7 @@ fn create_transactions_batch(conn: &Connection, body: &str) -> Response<Cursor<V
 
 fn list_transactions(conn: &Connection) -> Response<Cursor<Vec<u8>>> {
     let mut stmt = conn
-        .prepare(&format!(
-            "SELECT {TRANSACTION_COLUMNS} FROM transactions ORDER BY date DESC, id"
-        ))
+        .prepare(&format!("{TRANSACTION_SELECT} ORDER BY t.date DESC, t.id"))
         .expect("prepare list transactions");
     let rows: Vec<TransactionResponse> = stmt
         .query_map([], transaction_json)
@@ -532,11 +584,7 @@ fn patch_transaction(conn: &Connection, id: &str, body: &str) -> Response<Cursor
     match updated {
         Ok(0) => not_found(),
         Ok(_) => conn
-            .query_row(
-                &format!("SELECT {TRANSACTION_COLUMNS} FROM transactions WHERE id = ?1"),
-                [id],
-                transaction_json,
-            )
+            .query_row(&format!("{TRANSACTION_SELECT} WHERE t.id = ?1"), [id], transaction_json)
             .map(|row| json_response(200, serde_json::to_string(&row).unwrap()))
             .unwrap_or_else(|e| db_error_response(&e)),
         Err(e) => db_error_response(&e),
@@ -909,7 +957,7 @@ mod tests {
         String::from_utf8(response.into_reader().into_inner()).unwrap()
     }
 
-    const TXN_BODY: &str = r#"{"id": "t1", "description": "Coffee", "date": "2024-01-01T12:00:00Z", "amount": -500, "account_id": 1, "opposing_account_id": 4}"#;
+    const TXN_BODY: &str = r#"{"id": "t1", "description": "Coffee", "date": "2024-01-01T12:00:00Z", "amount": -5.00, "account_id": 1, "opposing_account_id": 4}"#;
 
     #[test]
     fn create_transaction_returns_201_with_row() {
@@ -920,10 +968,56 @@ mod tests {
     }
 
     #[test]
+    fn amount_round_trips_through_major_units_at_the_api_boundary() {
+        let conn = test_db();
+        route(&conn, &Method::Post, "/transactions", TXN_BODY);
+
+        // DB stores SEK's minor units: -5.00 major -> -500 minor.
+        let stored: i64 = conn
+            .query_row("SELECT amount FROM transactions WHERE id = 't1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, -500);
+
+        // Read back through the API, it's major units again.
+        let response = route(&conn, &Method::Get, "/transactions", "");
+        let body = response_body(response);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed[0]["amount"], -5.0);
+    }
+
+    #[test]
+    fn amount_with_more_precision_than_currency_allows_is_400() {
+        let conn = test_db();
+        // SEK has minor_unit 2; three decimal places isn't representable.
+        let body = r#"{"id": "t1", "description": "Coffee", "date": "2024-01-01T12:00:00Z", "amount": -5.005, "account_id": 1, "opposing_account_id": 4}"#;
+        let response = route(&conn, &Method::Post, "/transactions", body);
+        assert_eq!(response.status_code().0, 400);
+    }
+
+    #[test]
+    fn cross_currency_opposing_amount_uses_its_own_currency_minor_unit() {
+        let conn = test_db();
+        // account 1 is SEK, account 3 is USD; both minor_unit 2 in test_db(),
+        // but each amount is independently converted via its own account.
+        let body = r#"{"id": "t1", "description": "Transfer", "date": "2024-01-01T12:00:00Z", "amount": -5.00, "opposing_amount": 5.00, "account_id": 1, "opposing_account_id": 3}"#;
+        let response = route(&conn, &Method::Post, "/transactions", body);
+        assert_eq!(response.status_code().0, 201);
+
+        let (amount, opposing_amount): (i64, i64) = conn
+            .query_row(
+                "SELECT amount, opposing_amount FROM transactions WHERE id = 't1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((amount, opposing_amount), (-500, 500));
+    }
+
+    #[test]
     fn create_transaction_validation_failure_is_400() {
         let conn = test_db();
         // account_id must be 'own'; account 4 is 'external'.
-        let body = r#"{"id": "t1", "description": "Coffee", "date": "2024-01-01T12:00:00Z", "amount": -500, "account_id": 4, "opposing_account_id": 1}"#;
+        let body = r#"{"id": "t1", "description": "Coffee", "date": "2024-01-01T12:00:00Z", "amount": -5.00, "account_id": 4, "opposing_account_id": 1}"#;
         let response = route(&conn, &Method::Post, "/transactions", body);
         assert_eq!(response.status_code().0, 400);
 
@@ -944,8 +1038,8 @@ mod tests {
         let body = r#"{
             "batch_id": "b1",
             "transactions": [
-                {"id": "t1", "description": "Coffee", "date": "2024-01-01T12:00:00Z", "amount": -500, "account_id": 1, "opposing_account_id": 4},
-                {"id": "t2", "description": "Lunch", "date": "2024-01-02T12:00:00Z", "amount": -1000, "account_id": 1, "opposing_account_id": 4}
+                {"id": "t1", "description": "Coffee", "date": "2024-01-01T12:00:00Z", "amount": -5.00, "account_id": 1, "opposing_account_id": 4},
+                {"id": "t2", "description": "Lunch", "date": "2024-01-02T12:00:00Z", "amount": -10.00, "account_id": 1, "opposing_account_id": 4}
             ]
         }"#;
         let response = route(&conn, &Method::Post, "/transactions/batch", body);
@@ -963,8 +1057,8 @@ mod tests {
         let body = r#"{
             "batch_id": "b1",
             "transactions": [
-                {"id": "t1", "description": "Coffee", "date": "2024-01-01T12:00:00Z", "amount": -500, "account_id": 1, "opposing_account_id": 4},
-                {"id": "t2", "description": "Bad", "date": "2024-01-02T12:00:00Z", "amount": -1000, "account_id": 4, "opposing_account_id": 1}
+                {"id": "t1", "description": "Coffee", "date": "2024-01-01T12:00:00Z", "amount": -5.00, "account_id": 1, "opposing_account_id": 4},
+                {"id": "t2", "description": "Bad", "date": "2024-01-02T12:00:00Z", "amount": -10.00, "account_id": 4, "opposing_account_id": 1}
             ]
         }"#;
         let response = route(&conn, &Method::Post, "/transactions/batch", body);
@@ -985,8 +1079,8 @@ mod tests {
         let body = r#"{
             "batch_id": "b1",
             "transactions": [
-                {"id": "t2", "description": "Coffee", "date": "2024-01-02T12:00:00Z", "amount": -500, "account_id": 1, "opposing_account_id": 4},
-                {"id": "t1", "description": "Dup", "date": "2024-01-03T12:00:00Z", "amount": -1000, "account_id": 1, "opposing_account_id": 4}
+                {"id": "t2", "description": "Coffee", "date": "2024-01-02T12:00:00Z", "amount": -5.00, "account_id": 1, "opposing_account_id": 4},
+                {"id": "t1", "description": "Dup", "date": "2024-01-03T12:00:00Z", "amount": -10.00, "account_id": 1, "opposing_account_id": 4}
             ]
         }"#;
         let response = route(&conn, &Method::Post, "/transactions/batch", body);

@@ -398,14 +398,19 @@ components:
         date:
           type: string
         amount:
-          type: integer
-          description: Signed minor units, non-zero; positive = inflow to account_id
+          type: number
+          description: >
+            Signed major units (e.g. 12.34), non-zero; positive = inflow to
+            account_id. Rejected with 400 if it has more decimal places than
+            account_id's currency's minor_unit allows.
         opposing_amount:
-          type: integer
+          type: number
           nullable: true
           description: >
-            Unsigned magnitude, required iff both accounts are 'own' with
-            differing currencies; otherwise must be omitted/null.
+            Unsigned magnitude in major units, required iff both accounts are
+            'own' with differing currencies; otherwise must be omitted/null.
+            Rejected with 400 if it has more decimal places than
+            opposing_account_id's currency's minor_unit allows.
         account_id:
           type: integer
           description: Must reference an account of type 'own'
