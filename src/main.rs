@@ -118,6 +118,11 @@ fn major_to_minor(major: f64, minor_unit: i64) -> Result<i64, String> {
     if (scaled - rounded).abs() > 1e-6 {
         return Err(format!("amount has more precision than the currency's {minor_unit} decimal places"));
     }
+    // f64->i64 `as` saturates rather than erroring; catch out-of-range amounts
+    // here instead of silently storing i64::MAX/MIN.
+    if !rounded.is_finite() || rounded.abs() >= i64::MAX as f64 {
+        return Err("amount out of range".to_string());
+    }
     Ok(rounded as i64)
 }
 
@@ -506,20 +511,19 @@ fn create_transactions_batch(conn: &Connection, body: &str) -> Response<Cursor<V
         return error_response(400, "expected {batch_id, transactions: [...]}");
     };
 
-    conn.execute_batch("BEGIN").expect("begin batch transaction");
+    // Connection::transaction() rolls back on Drop unless committed, so a
+    // panic mid-batch can't leave the shared connection stuck open.
+    let txn = conn.unchecked_transaction().expect("begin batch transaction");
 
     let mut created = Vec::new();
     for item in req.transactions {
-        match insert_transaction(conn, item, Some(&req.batch_id)) {
-            Ok(txn) => created.push(txn),
-            Err(resp) => {
-                conn.execute_batch("ROLLBACK").expect("rollback batch transaction");
-                return resp;
-            }
+        match insert_transaction(&txn, item, Some(&req.batch_id)) {
+            Ok(row) => created.push(row),
+            Err(resp) => return resp,
         }
     }
 
-    conn.execute_batch("COMMIT").expect("commit batch transaction");
+    txn.commit().expect("commit batch transaction");
     json_response(201, serde_json::to_string(&created).unwrap())
 }
 
@@ -552,12 +556,24 @@ fn patch_transaction(conn: &Connection, id: &str, body: &str) -> Response<Cursor
         return error_response(400, "only description and category_id may be updated");
     }
 
-    let description = fields.get("description").and_then(|v| v.as_str());
+    let description = match fields.get("description") {
+        Some(v) => match v.as_str() {
+            Some(s) => Some(s),
+            None => return error_response(400, "description must be a string"),
+        },
+        None => None,
+    };
     // category_id may be legitimately cleared to NULL, so "present" (even as
     // `null`) and "absent" need different SQL behavior — COALESCE alone can't
     // tell "leave unchanged" from "set to NULL".
     let category_id_given = fields.contains_key("category_id");
-    let category_id = fields.get("category_id").and_then(|v| v.as_i64());
+    let category_id = match fields.get("category_id") {
+        Some(serde_json::Value::Null) | None => None,
+        Some(v) => match v.as_i64() {
+            Some(n) => Some(n),
+            None => return error_response(400, "category_id must be an integer or null"),
+        },
+    };
 
     let updated = conn.execute(
         "UPDATE transactions SET description = COALESCE(?1, description), \
@@ -1081,6 +1097,20 @@ mod tests {
     }
 
     #[test]
+    fn amount_out_of_range_is_rejected_instead_of_saturating() {
+        let conn = test_db();
+        // Large enough that scaling by minor_unit loses all fractional
+        // precision (passing the epsilon check) but is nowhere near a real
+        // amount; must not silently saturate to i64::MAX.
+        let body = r#"{"id": "t1", "description": "Bogus", "date": "2024-01-01T12:00:00Z", "amount": 1e300, "account_id": 1, "opposing_account_id": 4}"#;
+        let response = route(&conn, &Method::Post, "/transactions", body);
+        assert_eq!(response.status_code().0, 400);
+
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM transactions", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0, "out-of-range amount must not be stored");
+    }
+
+    #[test]
     fn cross_currency_opposing_amount_uses_its_own_currency_minor_unit() {
         let conn = test_db();
         // account 1 is SEK, account 3 is USD; both minor_unit 2 in test_db(),
@@ -1300,6 +1330,45 @@ mod tests {
         // trip the immutable-field check.
         let response = route(&conn, &Method::Patch, "/transactions/t1", r#"{"description": "amount due"}"#);
         assert_eq!(response.status_code().0, 200);
+    }
+
+    #[test]
+    fn patch_rejects_non_string_description() {
+        let conn = test_db();
+        conn.execute(
+            "INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id) VALUES ('t1', 'Old', '2024-01-01', -100, 1, 4)",
+            [],
+        )
+        .unwrap();
+
+        let response = route(&conn, &Method::Patch, "/transactions/t1", r#"{"description": 123}"#);
+        assert_eq!(response.status_code().0, 400);
+
+        let description: String = conn
+            .query_row("SELECT description FROM transactions WHERE id = 't1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(description, "Old", "rejected PATCH must not have mutated the row");
+    }
+
+    #[test]
+    fn patch_rejects_non_integer_category_id_instead_of_nulling_it() {
+        let conn = test_db();
+        conn.execute_batch(
+            "
+            INSERT INTO categories (id, name) VALUES (1, 'Food');
+            INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id, category_id)
+                VALUES ('t1', 'Old', '2024-01-01', -100, 1, 4, 1);
+            ",
+        )
+        .unwrap();
+
+        let response = route(&conn, &Method::Patch, "/transactions/t1", r#"{"category_id": "5"}"#);
+        assert_eq!(response.status_code().0, 400);
+
+        let category_id: Option<i64> = conn
+            .query_row("SELECT category_id FROM transactions WHERE id = 't1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(category_id, Some(1), "rejected PATCH must not have cleared category_id");
     }
 
     #[test]
