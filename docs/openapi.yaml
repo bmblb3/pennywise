@@ -420,6 +420,8 @@ components:
           type: string
         date:
           type: string
+          format: date-time
+          description: RFC3339
         amount:
           type: number
           description: >
@@ -462,6 +464,8 @@ components:
           type: string
         date:
           type: string
+          format: date-time
+          description: RFC3339
         amount:
           type: number
           description: Major units, signed from this row's account's perspective.
