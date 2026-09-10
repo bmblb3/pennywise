@@ -25,6 +25,12 @@
       "skillPath": "skills/engineering/codebase-design/SKILL.md",
       "computedHash": "5a17552cc1482f1a40124bf4e6c9dbd90ac0dbb47e71c07d47369f9e5f2ae3b5"
     },
+    "critical-code-reviewer": {
+      "source": "posit-dev/skills",
+      "sourceType": "github",
+      "skillPath": "posit-dev/critical-code-reviewer/SKILL.md",
+      "computedHash": "3c45198ac0c3002eb964d02de022afb024ac395bff77547171eeea80d6e75a0d"
+    },
     "diagnosing-bugs": {
       "source": "mattpocock/skills",
       "sourceType": "github",
@@ -120,6 +126,12 @@
       "sourceType": "github",
       "skillPath": "skills/in-progress/retro/SKILL.md",
       "computedHash": "b9bd2e5e0378214bf54d2a293df50490669b845a4c2a71c8f747ce8ab365f53a"
+    },
+    "review-testing": {
+      "source": "posit-dev/skills",
+      "sourceType": "github",
+      "skillPath": "posit-dev/review-testing/SKILL.md",
+      "computedHash": "d650b79ca68f33d6f5a92985f282529b2eb10cfc5ddf1c9b62eff95e2ea4ba8c"
     },
     "scaffold-exercises": {
       "source": "mattpocock/skills",
