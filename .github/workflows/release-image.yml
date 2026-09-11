@@ -1,67 +1,43 @@
 name: Release Docker image
 
+# Builds nothing. ci.yml already built and pushed this exact commit as
+# :sha-<sha>, so releasing is a registry-side manifest copy -- seconds rather
+# than a full rebuild.
 on:
   push:
     tags:
       - "v*"
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          # Must match ci.yml, whose master runs seed the only cache scope a
-          # tag run can restore from (see the comment in that file).
-          shared-key: test
-      - run: cargo test --release
-
-  build-and-push:
-    needs: test
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: docker/metadata-action@v5
-        id: meta
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=raw,value=latest
-
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          # Read-only by design: ci.yml's master runs are the sole writer. A
-          # `cache-to` here would export ~420 MB per release into a tag-scoped
-          # cache that no later run is ever permitted to read.
-          cache-from: type=gha
-
   release:
-    needs: build-and-push
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      packages: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
+      - run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      # Pushing master and the tag together is the normal flow here, so ci.yml
+      # is usually still building when this starts. Wait for it instead of
+      # racing it; 10 min is well past a cold build of this Dockerfile.
+      - name: Wait for master's build of this commit
+        run: |
+          image=ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+          timeout 600 bash -c 'until docker buildx imagetools inspect "$0" >/dev/null 2>&1; do sleep 10; done' "$image" \
+            || { echo "::error::$image was never published -- did master's build fail?"; exit 1; }
+
+      - name: Promote to ${{ github.ref_name }} and latest
+        run: |
+          image=ghcr.io/${{ github.repository }}
+          docker buildx imagetools create \
+            --tag "$image:${GITHUB_REF_NAME#v}" \
+            --tag "$image:latest" \
+            "$image:sha-${{ github.sha }}"
+
+      # `gh` is preinstalled on the runner, so this needs no action and no
+      # checkout -- GH_REPO stands in for the git remote.
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "$GITHUB_REF_NAME" --generate-notes
