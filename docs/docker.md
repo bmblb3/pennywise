@@ -1,6 +1,6 @@
 # Running Pennywise via Docker
 
-Images are published to `ghcr.io/bmblb3/pennywise` on every `vX.Y.Z` tag, as both the exact version and `latest`.
+Images are published to `ghcr.io/bmblb3/pennywise` on every `vX.Y.Z` tag, as both the exact version and `latest`. Pushes to `master` build the same image without publishing it — that run exists to catch a broken `Dockerfile` before a release is in flight, and to write the layer cache the tag build restores from.
 
 ```sh
 docker run -d \
