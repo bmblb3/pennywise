@@ -12,6 +12,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Must match ci.yml, whose master runs seed the only cache scope a
+          # tag run can restore from (see the comment in that file).
+          shared-key: test
       - run: cargo test --release
 
   build-and-push:

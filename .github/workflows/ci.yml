@@ -1,0 +1,23 @@
+name: CI
+
+# Exists mainly to seed a default-branch-scoped cargo cache. GitHub Actions
+# caches are only readable from the ref that wrote them or from the default
+# branch, and the release workflow only ever runs on `v*` tags — so without a
+# master run, every tag build writes a cache scope nothing can ever read.
+on:
+  push:
+    branches: [master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Must match release-image.yml so tag runs can fall back to this cache.
+          shared-key: test
+      # --release to match release-image.yml: a debug target/ dir would be
+      # cached but useless to the job that needs to restore it.
+      - run: cargo test --release
