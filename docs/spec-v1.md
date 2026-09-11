@@ -59,6 +59,8 @@ CREATE TABLE transactions (
     created_at           TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at           TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE UNIQUE INDEX accounts_name_type ON accounts (name, type);
 ```
 
 `account_id`/`opposing_account_id` references need no explicit `ON DELETE` clause: SQLite's default (`NO ACTION`, enforced immediately since nothing here defers foreign keys) already rejects deleting an account that transactions still point at, which is the desired behavior.
@@ -75,7 +77,7 @@ SQLite does not enforce `REFERENCES` clauses without this — off by default, it
 
 ### Migrations
 
-On startup, read `PRAGMA user_version`. If `0`, run the embedded schema above once and set it to `1`. If `1`, do nothing. No migration framework — the schema is finalized, so v1 has exactly one migration; add a framework at migration three, not migration one.
+On startup, read `PRAGMA user_version`. If `0`, run the embedded schema above once and set it to `1`. If `1`, do nothing. Any other value panics — an unrecognized schema version means the database is newer than this binary, or corrupt, and there is nothing safe to do but stop. No migration framework — the schema is finalized, so v1 has exactly one migration; add a framework at migration three, not migration one.
 
 ## Cross-table validation
 
