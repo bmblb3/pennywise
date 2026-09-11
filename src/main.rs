@@ -136,6 +136,12 @@ fn validate_transaction(
     opposing_account_id: i64,
     opposing_amount: Option<i64>,
 ) -> Result<(), String> {
+    // ponytail: belongs in a schema CHECK per spec-v1.md; deferred here to
+    // avoid a solo 12-step table rebuild, see #29 (folds this in with #16).
+    if account_id == opposing_account_id {
+        return Err("account_id and opposing_account_id must differ".to_string());
+    }
+
     let lookup = |id: i64| -> Result<(String, Option<i64>), String> {
         conn.query_row(
             "SELECT type, currency_id FROM accounts WHERE id = ?1",
@@ -827,6 +833,12 @@ mod tests {
     fn external_as_account_id_is_rejected() {
         let conn = test_db();
         assert!(validate_transaction(&conn, 4, 1, None).is_err());
+    }
+
+    #[test]
+    fn same_account_on_both_sides_is_rejected() {
+        let conn = test_db();
+        assert!(validate_transaction(&conn, 1, 1, None).is_err());
     }
 
     #[test]
