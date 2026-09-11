@@ -1,6 +1,6 @@
 # Pennywise v2 spec
 
-v2 adds exactly four things on top of [v1](spec-v1.md): `GET /balances`, `DELETE /batches/{id}`, piggy banks, and tags. v1 is frozen — it stays as the historical record of what shipped first, and everything here is additive. See `CONTEXT.md` for the vocabulary this spec uses.
+v2 makes three additions on top of [v1](spec-v1.md) — `GET /balances`, piggy banks, and tags — and one removal: `batch_id`. v1 is frozen — it stays as the historical record of what shipped first; v2 is no longer purely additive. See `CONTEXT.md` for the vocabulary this spec uses.
 
 > **Draft.** Sections land one at a time and get reconciled into a single document (naming, ordering, updated non-goals) once all four are written.
 
@@ -42,27 +42,14 @@ Sum in **minor units** (`INTEGER`) and convert to major units only when serializ
 
 This is the only aggregation endpoint in v2. v1 ruled out "reports or aggregation of any kind"; v2 narrows that to permit own-account balances and nothing else — net worth, category summaries, and per-period totals stay out.
 
-### `DELETE /batches/{id}`
+## Removed
 
-Removes every Transaction carrying `batch_id = {id}`. The symmetric undo of `POST /transactions/batch`: an import went in as a unit, it comes out as a unit.
+### `batch_id`
 
-- **`204` on success**, no body — matching `DELETE /transactions/{id}` and `DELETE /accounts/{id}`.
-- **`404` when no Transaction carries that `batch_id`.** This also covers the second call, so the status code is not idempotent and "already deleted" is indistinguishable from "never existed". Accepted: there is no batch registry to consult, only the rows themselves.
-- **No `400` case.** Nothing in the schema references a Transaction, so no foreign key can block the delete.
-- **Hard delete.** No soft-delete flag, no tombstone, and no "has this been edited since import?" check — v1 has no field that could answer that reliably (`updated_at` moves for reasons unrelated to a correction), and v2 isn't adding one.
-- **`{id}` is caller-supplied text**, like a Transaction id, and the router does not percent-decode path segments: a batch id containing `/` or `%` will not round-trip. This is an existing constraint inherited from `DELETE /transactions/{id}`; the fix is to choose URL-safe batch ids, not to add decoding.
+`batch_id` is dropped entirely — a breaking change to the already-shipped v1 API, carried out in v2 rather than left for v1 to decide. See [ADR 0003](adr/0003-drop-batch-id.md).
 
-#### What a batch actually is
-
-`batch_id` is a plain caller-supplied `TEXT` column with no uniqueness constraint and no `batches` table behind it — a Batch exists only as "the set of rows carrying this string". Two consequences worth stating rather than leaving to be discovered:
-
-- `POST /transactions` accepts a `batch_id` as well, so a Batch is not necessarily one `POST /transactions/batch` call. Whatever carries the string is deleted, regardless of how it was inserted.
-- There is no `GET /batches` to discover ids. The caller minted the `batch_id` on the way in, so remembering it is the caller's job. A listing endpoint is not part of v2.
-
-#### Implementation
-
-A single `DELETE FROM transactions WHERE batch_id = ?1`, with the affected-row count choosing `204` over `404` — the same shape as `delete_transaction`. A lone `DELETE` is already its own implicit SQLite transaction, so it is atomic without an explicit `BEGIN`; don't wrap it in one, and don't `SELECT` first to check existence.
-
-No schema change and no migration: `batch_id` has been populated on every import since v1, with no endpoint acting on it. **No index on `batch_id` either** — a full scan across one person's ledger, on an operation run by hand a few times a year, is not worth an index that every insert then has to maintain.
-
-Deleting a Batch frees every Transaction `id` in it, so re-importing the same source file re-creates those Transactions (`CONTEXT.md`: a Transaction's `id` is the sole dedup mechanism, and deletion is not durable). Here that is the point rather than a caveat — the expected repair loop is delete the bad import, fix the importer, import again.
+- **Schema migration.** `ALTER TABLE transactions DROP COLUMN batch_id` — `rusqlite` 0.31 bundles a SQLite new enough to drop a column directly, so this is a plain migration, not the create-copy-drop-rename dance v1's `CHECK`-adding migration needed.
+- **`POST /transactions` and `POST /transactions/batch` no longer accept or return `batch_id`.** The field disappears from both request and response shapes on both endpoints.
+- **`POST /transactions/batch` otherwise keeps its name, path, and atomic-rollback behavior unchanged.** It's still one atomic SQLite transaction, rolled back together on any invalid or duplicate row — "batch" in the name is now plain English, not a reference to a stored grouping.
+- **No export or migration of existing values.** Existing rows' `batch_id` values are dropped with the column, unread — no endpoint ever read that grouping back out.
+- **`DELETE /batches/{id}` does not ship.** It was spec'd on the premise that `batch_id` needed a consumer; with the column gone, so is the endpoint and the domain concept of a Batch (`CONTEXT.md`).
