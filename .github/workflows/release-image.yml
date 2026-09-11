@@ -50,8 +50,10 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Read-only by design: ci.yml's master runs are the sole writer. A
+          # `cache-to` here would export ~420 MB per release into a tag-scoped
+          # cache that no later run is ever permitted to read.
           cache-from: type=gha
-          cache-to: type=gha,mode=max
 
   release:
     needs: build-and-push

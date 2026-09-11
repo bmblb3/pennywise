@@ -1,9 +1,11 @@
 name: CI
 
-# Exists mainly to seed a default-branch-scoped cargo cache. GitHub Actions
-# caches are only readable from the ref that wrote them or from the default
-# branch, and the release workflow only ever runs on `v*` tags — so without a
-# master run, every tag build writes a cache scope nothing can ever read.
+# This workflow is the sole writer of both CI caches. GitHub Actions caches are
+# only readable from the ref that wrote them or from the repository's default
+# branch, and release-image.yml only ever runs on `v*` tags — so a cache written
+# by a tag build lands in a scope nothing can ever read again. Running the same
+# work on master puts both caches in the default-branch scope, which is the one
+# scope tag builds are allowed to fall back to.
 on:
   push:
     branches: [master]
@@ -21,3 +23,24 @@ jobs:
       # --release to match release-image.yml: a debug target/ dir would be
       # cached but useless to the job that needs to restore it.
       - run: cargo test --release
+
+  # Deliberately not `needs: test`. The dependency layer this seeds is keyed on
+  # Cargo.toml/Cargo.lock, not on whether tests pass, so gating it on green
+  # tests would skip a perfectly valid cache refresh whenever master is red.
+  # Running in parallel also gets the Dockerfile its own build signal, which the
+  # test job does not cover.
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      # Nothing is published from master; this builds only to populate the
+      # layer cache that release-image.yml reads. `platforms` must match the
+      # release build or buildkit keys the cache differently and never hits.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
