@@ -57,11 +57,15 @@ CREATE TABLE transactions (
     opposing_account_id  INTEGER NOT NULL REFERENCES accounts(id),
     category_id          INTEGER REFERENCES categories(id) ON DELETE SET NULL,
     created_at           TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at           TEXT NOT NULL DEFAULT (datetime('now'))
+    updated_at           TEXT NOT NULL DEFAULT (datetime('now')),
+    CHECK (account_id <> opposing_account_id),
+    CHECK (substr(date,1,19) IS strftime('%Y-%m-%dT%H:%M:%S', substr(date,1,19)))
 );
 
 CREATE UNIQUE INDEX accounts_name_type ON accounts (name, type);
 ```
+
+The two `transactions` `CHECK`s are a database-level backstop for constraints already enforced at the API layer (`validate_transaction`'s account check, and `is_rfc3339`'s full-RFC3339 date check) — they exist to catch writes that don't go through the app (a manual edit, a future script), not to replace the app-level checks. The date `CHECK` validates only the `YYYY-MM-DDTHH:MM:SS` prefix via `strftime` (real calendar correctness — rejects month 13, hour 25, unpadded digits); it uses `IS` rather than `=` because `strftime` returns `NULL` on unparseable input and a `NULL`-evaluating `CHECK` otherwise passes. It does not validate the trailing timezone offset/`Z` — SQLite has no native offset-aware date parsing, so that half of RFC3339 stays an app-only guarantee.
 
 `account_id`/`opposing_account_id` references need no explicit `ON DELETE` clause: SQLite's default (`NO ACTION`, enforced immediately since nothing here defers foreign keys) already rejects deleting an account that transactions still point at, which is the desired behavior.
 
@@ -77,7 +81,7 @@ SQLite does not enforce `REFERENCES` clauses without this — off by default, it
 
 ### Migrations
 
-On startup, read `PRAGMA user_version`. If `0`, run the embedded schema above once and set it to `1`. If `1`, do nothing. Any other value panics — an unrecognized schema version means the database is newer than this binary, or corrupt, and there is nothing safe to do but stop. No migration framework — the schema is finalized, so v1 has exactly one migration; add a framework at migration three, not migration one.
+On startup, read `PRAGMA user_version`. If `0`, run the embedded schema above once (already including both `transactions` `CHECK`s) and set it to `2`. If `1` — a database created before those `CHECK`s existed — rebuild `transactions` (SQLite can't `ALTER TABLE ... ADD CHECK`: create a new table with the constraints, copy rows across, drop the old one, rename) and set it to `2`. If `2`, do nothing. Any other value panics — an unrecognized schema version means the database is newer than this binary, or corrupt, and there is nothing safe to do but stop. No migration framework — the schema is finalized, so v1 has exactly two migrations; add a framework at migration three, not migration one.
 
 ## Cross-table validation
 

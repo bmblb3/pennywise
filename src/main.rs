@@ -40,8 +40,34 @@ CREATE TABLE transactions (
     opposing_account_id  INTEGER NOT NULL REFERENCES accounts(id),
     category_id          INTEGER REFERENCES categories(id) ON DELETE SET NULL,
     created_at           TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at           TEXT NOT NULL DEFAULT (datetime('now'))
+    updated_at           TEXT NOT NULL DEFAULT (datetime('now')),
+    CHECK (account_id <> opposing_account_id),
+    CHECK (substr(date,1,19) IS strftime('%Y-%m-%dT%H:%M:%S', substr(date,1,19)))
 );
+";
+
+/// 12-step table rebuild adding the two CHECKs above to a `transactions` table
+/// created before they existed (SQLite can't ALTER TABLE ... ADD CHECK).
+const REBUILD_TRANSACTIONS_V1_TO_V2: &str = "
+CREATE TABLE transactions_new (
+    id                   TEXT PRIMARY KEY,
+    batch_id             TEXT,
+    description          TEXT NOT NULL,
+    date                 TEXT NOT NULL,
+    amount               INTEGER NOT NULL CHECK (amount != 0),
+    opposing_amount      INTEGER CHECK (opposing_amount IS NULL OR opposing_amount > 0),
+    account_id           INTEGER NOT NULL REFERENCES accounts(id),
+    opposing_account_id  INTEGER NOT NULL REFERENCES accounts(id),
+    category_id          INTEGER REFERENCES categories(id) ON DELETE SET NULL,
+    created_at           TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at           TEXT NOT NULL DEFAULT (datetime('now')),
+    CHECK (account_id <> opposing_account_id),
+    CHECK (substr(date,1,19) IS strftime('%Y-%m-%dT%H:%M:%S', substr(date,1,19)))
+);
+INSERT INTO transactions_new SELECT * FROM transactions;
+DROP TABLE transactions;
+ALTER TABLE transactions_new RENAME TO transactions;
+PRAGMA user_version = 2;
 ";
 
 struct Config {
@@ -80,10 +106,14 @@ fn migrate(conn: &Connection) {
         0 => {
             conn.execute_batch(SCHEMA)
                 .expect("failed to apply schema");
-            conn.execute_batch("PRAGMA user_version = 1;")
+            conn.execute_batch("PRAGMA user_version = 2;")
                 .expect("failed to set user_version");
         }
-        1 => {}
+        1 => {
+            conn.execute_batch(REBUILD_TRANSACTIONS_V1_TO_V2)
+                .expect("failed to rebuild transactions table");
+        }
+        2 => {}
         other => panic!("unknown database schema version: {other}"),
     }
 }
@@ -136,8 +166,9 @@ fn validate_transaction(
     opposing_account_id: i64,
     opposing_amount: Option<i64>,
 ) -> Result<(), String> {
-    // ponytail: belongs in a schema CHECK per spec-v1.md; deferred here to
-    // avoid a solo 12-step table rebuild, see #29 (folds this in with #16).
+    // Also enforced by a schema CHECK (belt-and-suspenders per spec-v1.md);
+    // kept here too for a clean validation-style message instead of a raw
+    // SQLite constraint error.
     if account_id == opposing_account_id {
         return Err("account_id and opposing_account_id must differ".to_string());
     }
@@ -805,7 +836,93 @@ mod tests {
         let user_version: i64 = conn
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(user_version, 1, "setup() must apply schema via migrate(), not duplicate SCHEMA directly");
+        assert_eq!(user_version, 2, "setup() must apply schema via migrate(), not duplicate SCHEMA directly");
+    }
+
+    #[test]
+    fn migrating_from_version_1_rebuilds_transactions_table_with_checks() {
+        // Simulates a database created before the account/date CHECKs existed.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE currencies (id INTEGER PRIMARY KEY, code TEXT NOT NULL UNIQUE, minor_unit INTEGER NOT NULL);
+            CREATE TABLE accounts (
+                id INTEGER PRIMARY KEY, name TEXT NOT NULL, type TEXT NOT NULL, currency_id INTEGER REFERENCES currencies(id)
+            );
+            CREATE TABLE categories (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
+            CREATE TABLE transactions (
+                id                   TEXT PRIMARY KEY,
+                batch_id             TEXT,
+                description          TEXT NOT NULL,
+                date                 TEXT NOT NULL,
+                amount               INTEGER NOT NULL CHECK (amount != 0),
+                opposing_amount      INTEGER CHECK (opposing_amount IS NULL OR opposing_amount > 0),
+                account_id           INTEGER NOT NULL REFERENCES accounts(id),
+                opposing_account_id  INTEGER NOT NULL REFERENCES accounts(id),
+                category_id          INTEGER REFERENCES categories(id) ON DELETE SET NULL,
+                created_at           TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at           TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            INSERT INTO currencies (id, code, minor_unit) VALUES (1, 'SEK', 2);
+            INSERT INTO accounts (id, name, type, currency_id) VALUES (1, 'Wallet', 'own', 1), (2, 'Other', 'own', 1);
+            INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id)
+                VALUES ('legacy', 'x', '2024-01-01T00:00:00Z', -100, 1, 2);
+            PRAGMA user_version = 1;
+            ",
+        )
+        .unwrap();
+
+        migrate(&conn);
+
+        let user_version: i64 = conn.query_row("PRAGMA user_version;", [], |row| row.get(0)).unwrap();
+        assert_eq!(user_version, 2);
+
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM transactions", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 1, "pre-existing rows must survive the rebuild");
+
+        let err = conn
+            .execute(
+                "INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id)
+                 VALUES ('new', 'x', '2024-01-01T00:00:00Z', -100, 1, 1)",
+                [],
+            )
+            .unwrap_err();
+        let (status, message) = map_db_error(&err);
+        assert_eq!(status, 400);
+        assert!(message.contains("account_id"), "unexpected message: {message}");
+    }
+
+    #[test]
+    fn schema_rejects_self_referencing_transaction_row() {
+        let conn = test_db();
+        let err = conn
+            .execute(
+                "INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id)
+                 VALUES ('t', 'x', '2024-01-01T00:00:00Z', -100, 1, 1)",
+                [],
+            )
+            .unwrap_err();
+        let (status, message) = map_db_error(&err);
+        assert_eq!(status, 400);
+        assert!(message.contains("account_id"), "unexpected message: {message}");
+    }
+
+    #[test]
+    fn schema_rejects_malformed_date_row() {
+        let conn = test_db();
+        for date in ["2024-1-5T12:00:00Z", "not-a-date", "2024-13-01T12:00:00Z"] {
+            let err = conn
+                .execute(
+                    "INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id)
+                     VALUES ('t', 'x', ?1, -100, 1, 4)",
+                    [date],
+                )
+                .unwrap_err();
+            let (status, message) = map_db_error(&err);
+            assert_eq!(status, 400, "date {date:?} should be rejected");
+            assert!(message.contains("date"), "unexpected message for {date:?}: {message}");
+        }
     }
 
     #[test]
@@ -975,7 +1092,7 @@ mod tests {
     fn delete_referenced_account_returns_400() {
         let conn = test_db();
         conn.execute(
-            "INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id) VALUES ('t1', 'x', '2024-01-01', 100, 1, 4)",
+            "INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id) VALUES ('t1', 'x', '2024-01-01T00:00:00Z', 100, 1, 4)",
             [],
         )
         .unwrap();
@@ -1033,7 +1150,7 @@ mod tests {
             INSERT INTO categories (id, name) VALUES (1, 'Food');
             INSERT INTO transactions
                 (id, description, date, amount, account_id, opposing_account_id, category_id)
-                VALUES ('t1', 'lunch', '2024-01-01', -100, 1, 2, 1);
+                VALUES ('t1', 'lunch', '2024-01-01T00:00:00Z', -100, 1, 2, 1);
             ",
         )
         .unwrap();
@@ -1200,7 +1317,7 @@ mod tests {
     fn batch_rolls_back_entirely_on_duplicate_id() {
         let conn = test_db();
         conn.execute(
-            "INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id) VALUES ('t1', 'x', '2024-01-01', -100, 1, 4)",
+            "INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id) VALUES ('t1', 'x', '2024-01-01T00:00:00Z', -100, 1, 4)",
             [],
         )
         .unwrap();
@@ -1224,9 +1341,9 @@ mod tests {
         conn.execute_batch(
             "
             INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id) VALUES
-                ('a', 'x', '2024-01-01', -100, 1, 4),
-                ('b', 'x', '2024-01-03', -100, 1, 4),
-                ('c', 'x', '2024-01-02', -100, 1, 4);
+                ('a', 'x', '2024-01-01T00:00:00Z', -100, 1, 4),
+                ('b', 'x', '2024-01-03T00:00:00Z', -100, 1, 4),
+                ('c', 'x', '2024-01-02T00:00:00Z', -100, 1, 4);
             ",
         )
         .unwrap();
@@ -1247,7 +1364,7 @@ mod tests {
             "
             INSERT INTO categories (id, name) VALUES (1, 'Food');
             INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id)
-                VALUES ('t1', 'Old', '2024-01-01', -100, 1, 4);
+                VALUES ('t1', 'Old', '2024-01-01T00:00:00Z', -100, 1, 4);
             ",
         )
         .unwrap();
@@ -1273,7 +1390,7 @@ mod tests {
     fn patch_rejecting_immutable_field_is_400() {
         let conn = test_db();
         conn.execute(
-            "INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id) VALUES ('t1', 'Old', '2024-01-01', -100, 1, 4)",
+            "INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id) VALUES ('t1', 'Old', '2024-01-01T00:00:00Z', -100, 1, 4)",
             [],
         )
         .unwrap();
@@ -1294,7 +1411,7 @@ mod tests {
             "
             INSERT INTO categories (id, name) VALUES (1, 'Food');
             INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id, category_id)
-                VALUES ('t1', 'Old', '2024-01-01', -100, 1, 4, 1);
+                VALUES ('t1', 'Old', '2024-01-01T00:00:00Z', -100, 1, 4, 1);
             ",
         )
         .unwrap();
@@ -1315,7 +1432,7 @@ mod tests {
             "
             INSERT INTO categories (id, name) VALUES (1, 'Food');
             INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id, category_id)
-                VALUES ('t1', 'Old', '2024-01-01', -100, 1, 4, 1);
+                VALUES ('t1', 'Old', '2024-01-01T00:00:00Z', -100, 1, 4, 1);
             ",
         )
         .unwrap();
@@ -1333,7 +1450,7 @@ mod tests {
     fn patch_value_containing_immutable_field_name_is_not_rejected() {
         let conn = test_db();
         conn.execute(
-            "INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id) VALUES ('t1', 'Old', '2024-01-01', -100, 1, 4)",
+            "INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id) VALUES ('t1', 'Old', '2024-01-01T00:00:00Z', -100, 1, 4)",
             [],
         )
         .unwrap();
@@ -1348,7 +1465,7 @@ mod tests {
     fn patch_rejects_non_string_description() {
         let conn = test_db();
         conn.execute(
-            "INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id) VALUES ('t1', 'Old', '2024-01-01', -100, 1, 4)",
+            "INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id) VALUES ('t1', 'Old', '2024-01-01T00:00:00Z', -100, 1, 4)",
             [],
         )
         .unwrap();
@@ -1369,7 +1486,7 @@ mod tests {
             "
             INSERT INTO categories (id, name) VALUES (1, 'Food');
             INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id, category_id)
-                VALUES ('t1', 'Old', '2024-01-01', -100, 1, 4, 1);
+                VALUES ('t1', 'Old', '2024-01-01T00:00:00Z', -100, 1, 4, 1);
             ",
         )
         .unwrap();
@@ -1394,7 +1511,7 @@ mod tests {
     fn delete_transaction_returns_204() {
         let conn = test_db();
         conn.execute(
-            "INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id) VALUES ('t1', 'x', '2024-01-01', -100, 1, 4)",
+            "INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id) VALUES ('t1', 'x', '2024-01-01T00:00:00Z', -100, 1, 4)",
             [],
         )
         .unwrap();
@@ -1433,7 +1550,7 @@ mod tests {
     fn own_to_own_same_currency_transfer_produces_two_postings() {
         let conn = test_db();
         conn.execute(
-            "INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id) VALUES ('t1', 'Move', '2024-01-01', -1000, 1, 2)",
+            "INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id) VALUES ('t1', 'Move', '2024-01-01T00:00:00Z', -1000, 1, 2)",
             [],
         )
         .unwrap();
@@ -1459,7 +1576,7 @@ mod tests {
         let conn = test_db();
         conn.execute(
             "INSERT INTO transactions (id, description, date, amount, opposing_amount, account_id, opposing_account_id) \
-             VALUES ('t1', 'FX transfer', '2024-01-01', -500, 500, 1, 3)",
+             VALUES ('t1', 'FX transfer', '2024-01-01T00:00:00Z', -500, 500, 1, 3)",
             [],
         )
         .unwrap();
