@@ -27,7 +27,7 @@ The complete record of Transactions.
 _Avoid_: history, journal, book, log
 
 **Transaction**:
-A single dated movement of money from one Account to another.
+A single dated movement of money from one Account to another. Deletion is not durable: a Transaction's `id` is the sole dedup mechanism (a re-insert with the same `id` is rejected), and a hard delete frees that `id`, so re-importing the same source file brings a deliberately deleted Transaction back. This is accepted, not a bug — the owner rarely deletes, and a delete is usually a mistake anyway.
 _Avoid_: entry, record, payment, purchase, expense
 
 **Amount**:

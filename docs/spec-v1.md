@@ -123,7 +123,7 @@ Standard envelope: `{"error": "<message>"}` on failure. Status codes: `201` crea
 - `POST /transactions/batch` — `{batch_id, transactions: [...]}`; every item shares `batch_id` and is run through the same validation function; the whole batch is one SQLite transaction, so a single invalid or duplicate row rolls back the entire batch rather than partially importing it
 - `GET /transactions` — full list, ordered by `date DESC, id`
 - `PATCH /transactions/{id}` — `{description?, category_id?}` only. `amount`, `date`, `account_id`, `opposing_account_id`, `batch_id`, and `id` are immutable; a request naming any of them is a `400`, not a silent no-op. Sets `updated_at` to now.
-- `DELETE /transactions/{id}` — removes the row outright (distinct from editing a structural field, so it doesn't conflict with the immutability rule above)
+- `DELETE /transactions/{id}` — removes the row outright (distinct from editing a structural field, so it doesn't conflict with the immutability rule above). No tombstone: `id` is freed, so re-importing the same source file re-creates a deliberately deleted Transaction (it hits the same `id`, so the 409 dedup path no longer applies). Accepted, see `CONTEXT.md` under Transaction.
 
 ## Implementation
 
