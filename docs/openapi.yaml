@@ -331,6 +331,27 @@ paths:
                 items:
                   $ref: "#/components/schemas/Posting"
 
+  /balances:
+    get:
+      summary: List the current balance of every own account
+      description: >
+        One row per own account, including accounts with no transactions
+        (balance 0) — a client listing accounts shouldn't have to
+        special-case "never used". An external account carries no
+        currency and isn't the owner's money to total, so it gets no row.
+        `balance` is the sum of that account's GET /postings rows, in
+        major units. Ordered by account_id.
+      operationId: listBalances
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Balance"
+
 components:
   parameters:
     IntId:
@@ -484,3 +505,17 @@ components:
         category:
           type: string
           nullable: true
+
+    Balance:
+      type: object
+      required: [account_id, account_name, balance, currency]
+      properties:
+        account_id:
+          type: integer
+        account_name:
+          type: string
+        balance:
+          type: number
+          description: Major units, summed over the account's GET /postings rows.
+        currency:
+          type: string

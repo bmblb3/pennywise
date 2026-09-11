@@ -1,5 +1,6 @@
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::Cursor;
 use tiny_http::{Header, Method, Response, Server};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -152,6 +153,18 @@ fn major_to_minor(major: f64, minor_unit: i64) -> Result<i64, String> {
 
 fn minor_to_major(minor: i64, minor_unit: i64) -> f64 {
     minor as f64 / 10f64.powi(minor_unit as i32)
+}
+
+/// A transaction's contribution, in minor units of its own currency, to the
+/// *opposing* account's balance when that account is 'own' (a Transfer):
+/// `opposing_amount` signed opposite `amount` for a cross-currency transfer,
+/// or `-amount` when `opposing_amount` is NULL (same-currency transfer).
+fn transfer_contribution_minor(amount: i64, opposing_amount: Option<i64>) -> i64 {
+    match opposing_amount {
+        Some(a) if amount < 0 => a,
+        Some(a) => -a,
+        None => -amount,
+    }
 }
 
 fn validate_transaction(
@@ -678,10 +691,8 @@ fn postings_from_row(row: &rusqlite::Row) -> rusqlite::Result<Vec<PostingRespons
 
     if opposing_type == "own" {
         let opposing_minor_unit = opposing_minor_unit.expect("'own' account always has a currency");
-        let opposing_major_amount = match opposing_amount {
-            Some(a) => minor_to_major(if amount < 0 { a } else { -a }, opposing_minor_unit),
-            None => minor_to_major(-amount, minor_unit),
-        };
+        let opposing_major_amount =
+            minor_to_major(transfer_contribution_minor(amount, opposing_amount), opposing_minor_unit);
         postings.push(PostingResponse {
             description,
             date,
@@ -707,6 +718,67 @@ fn list_postings(conn: &Connection) -> Response<Cursor<Vec<u8>>> {
         .flat_map(|r| r.expect("read posting row"))
         .collect();
     json_response(200, serde_json::to_string(&postings).unwrap())
+}
+
+// --- Balances ---------------------------------------------------------------
+//
+// One row per own account, summing the same contributions GET /postings
+// would emit for it: its own transactions as stored (`transfer_contribution_minor`
+// is the one place that rule lives, shared with `postings_from_row`), plus the
+// opposing leg of any own-to-own transfer. Summed in minor units, converted to
+// major units only for the response. Contributions to an external account's id
+// are computed the same as any other but never read back, since only own
+// accounts are queried below — cheaper than filtering the opposing account's
+// type out of the scan.
+
+#[derive(Serialize)]
+struct BalanceResponse {
+    account_id: i64,
+    account_name: String,
+    balance: f64,
+    currency: String,
+}
+
+fn minor_balances_by_account(conn: &Connection) -> HashMap<i64, i64> {
+    let mut stmt = conn
+        .prepare("SELECT account_id, opposing_account_id, amount, opposing_amount FROM transactions")
+        .expect("prepare transaction contributions");
+    let mut balances: HashMap<i64, i64> = HashMap::new();
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+            ))
+        })
+        .expect("query transaction contributions");
+    for row in rows {
+        let (account_id, opposing_account_id, amount, opposing_amount) = row.expect("read transaction row");
+        *balances.entry(account_id).or_insert(0) += amount;
+        *balances.entry(opposing_account_id).or_insert(0) += transfer_contribution_minor(amount, opposing_amount);
+    }
+    balances
+}
+
+fn list_balances(conn: &Connection) -> Response<Cursor<Vec<u8>>> {
+    let minor_balances = minor_balances_by_account(conn);
+    list(
+        conn,
+        "SELECT a.id, a.name, c.code, c.minor_unit FROM accounts a \
+         JOIN currencies c ON a.currency_id = c.id WHERE a.type = 'own' ORDER BY a.id",
+        |row| {
+            let account_id: i64 = row.get(0)?;
+            let minor_unit: i64 = row.get(3)?;
+            Ok(BalanceResponse {
+                account_id,
+                account_name: row.get(1)?,
+                currency: row.get(2)?,
+                balance: minor_to_major(minor_balances.get(&account_id).copied().unwrap_or(0), minor_unit),
+            })
+        },
+    )
 }
 
 // --- Routing ----------------------------------------------------------------
@@ -740,6 +812,8 @@ fn route(conn: &Connection, method: &Method, path: &str, body: &str) -> Response
         (Method::Delete, ["transactions", id]) => delete_transaction(conn, id),
 
         (Method::Get, ["postings"]) => list_postings(conn),
+
+        (Method::Get, ["balances"]) => list_balances(conn),
 
         _ => not_found(),
     }
@@ -1545,6 +1619,66 @@ mod tests {
 
         let to = postings.iter().find(|p| p["account"] == "Own USD").unwrap();
         assert_eq!(to["amount"], 5.0);
+        assert_eq!(to["currency"], "USD");
+    }
+
+    #[test]
+    fn balances_include_every_own_account_even_with_no_transactions() {
+        let conn = test_db();
+        let response = route(&conn, &Method::Get, "/balances", "");
+        assert_eq!(response.status_code().0, 200);
+        let balances: serde_json::Value = serde_json::from_str(&response_body(response)).unwrap();
+        let balances = balances.as_array().unwrap();
+        assert_eq!(balances.len(), 3, "external account must not get a row");
+
+        let a = balances.iter().find(|b| b["account_name"] == "Own SEK A").unwrap();
+        assert_eq!(a["balance"], 0.0);
+        assert_eq!(a["currency"], "SEK");
+        assert_eq!(a["account_id"], 1);
+    }
+
+    #[test]
+    fn balance_sums_own_to_external_and_transfer_legs() {
+        let conn = test_db();
+        // Own SEK A: -5.00 to External, then -10.00 transfer to Own SEK B.
+        route(&conn, &Method::Post, "/transactions", TXN_BODY);
+        conn.execute(
+            "INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id) VALUES ('t2', 'Move', '2024-01-01T00:00:00Z', -1000, 1, 2)",
+            [],
+        )
+        .unwrap();
+
+        let response = route(&conn, &Method::Get, "/balances", "");
+        let balances: serde_json::Value = serde_json::from_str(&response_body(response)).unwrap();
+        let balances = balances.as_array().unwrap();
+
+        let a = balances.iter().find(|b| b["account_name"] == "Own SEK A").unwrap();
+        assert_eq!(a["balance"], -15.0);
+
+        let b = balances.iter().find(|b| b["account_name"] == "Own SEK B").unwrap();
+        assert_eq!(b["balance"], 10.0);
+    }
+
+    #[test]
+    fn balance_of_cross_currency_transfer_target_uses_its_own_currency() {
+        let conn = test_db();
+        conn.execute(
+            "INSERT INTO transactions (id, description, date, amount, opposing_amount, account_id, opposing_account_id) \
+             VALUES ('t1', 'FX transfer', '2024-01-01T00:00:00Z', -500, 500, 1, 3)",
+            [],
+        )
+        .unwrap();
+
+        let response = route(&conn, &Method::Get, "/balances", "");
+        let balances: serde_json::Value = serde_json::from_str(&response_body(response)).unwrap();
+        let balances = balances.as_array().unwrap();
+
+        let from = balances.iter().find(|b| b["account_name"] == "Own SEK A").unwrap();
+        assert_eq!(from["balance"], -5.0);
+        assert_eq!(from["currency"], "SEK");
+
+        let to = balances.iter().find(|b| b["account_name"] == "Own USD").unwrap();
+        assert_eq!(to["balance"], 5.0);
         assert_eq!(to["currency"], "USD");
     }
 }
