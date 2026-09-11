@@ -49,7 +49,3 @@ _Avoid_: internal payment, self-payment
 **Category**:
 The classification attached to a Transaction for the owner's own reference. Purely descriptive — nothing in the Ledger depends on it being set or correct.
 _Avoid_: tag, label, bucket, type
-
-**Batch**:
-A group of Transactions inserted together, usually from one import, sharing a single identifier so they can be removed as a unit.
-_Avoid_: import, upload, group
