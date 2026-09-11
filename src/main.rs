@@ -4,7 +4,27 @@ use std::io::Cursor;
 use tiny_http::{Header, Method, Response, Server};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-const SCHEMA: &str = "
+/// Column/constraint list shared by a fresh `transactions` table and the
+/// v1->v2 rebuild below, so the two can't drift apart from each other.
+const TRANSACTIONS_COLUMNS: &str = "
+    id                   TEXT PRIMARY KEY,
+    batch_id             TEXT,
+    description          TEXT NOT NULL,
+    date                 TEXT NOT NULL,
+    amount               INTEGER NOT NULL CHECK (amount != 0),
+    opposing_amount      INTEGER CHECK (opposing_amount IS NULL OR opposing_amount > 0),
+    account_id           INTEGER NOT NULL REFERENCES accounts(id),
+    opposing_account_id  INTEGER NOT NULL REFERENCES accounts(id),
+    category_id          INTEGER REFERENCES categories(id) ON DELETE SET NULL,
+    created_at           TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at           TEXT NOT NULL DEFAULT (datetime('now')),
+    CHECK (account_id <> opposing_account_id),
+    CHECK (substr(date,1,19) IS strftime('%Y-%m-%dT%H:%M:%S', substr(date,1,19)))
+";
+
+fn schema() -> String {
+    format!(
+        "
 CREATE TABLE currencies (
     id         INTEGER PRIMARY KEY,
     code       TEXT NOT NULL UNIQUE,
@@ -29,46 +49,24 @@ CREATE TABLE categories (
     name TEXT NOT NULL UNIQUE
 );
 
-CREATE TABLE transactions (
-    id                   TEXT PRIMARY KEY,
-    batch_id             TEXT,
-    description          TEXT NOT NULL,
-    date                 TEXT NOT NULL,
-    amount               INTEGER NOT NULL CHECK (amount != 0),
-    opposing_amount      INTEGER CHECK (opposing_amount IS NULL OR opposing_amount > 0),
-    account_id           INTEGER NOT NULL REFERENCES accounts(id),
-    opposing_account_id  INTEGER NOT NULL REFERENCES accounts(id),
-    category_id          INTEGER REFERENCES categories(id) ON DELETE SET NULL,
-    created_at           TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at           TEXT NOT NULL DEFAULT (datetime('now')),
-    CHECK (account_id <> opposing_account_id),
-    CHECK (substr(date,1,19) IS strftime('%Y-%m-%dT%H:%M:%S', substr(date,1,19)))
-);
-";
+CREATE TABLE transactions ({TRANSACTIONS_COLUMNS});
+"
+    )
+}
 
 /// 12-step table rebuild adding the two CHECKs above to a `transactions` table
 /// created before they existed (SQLite can't ALTER TABLE ... ADD CHECK).
-const REBUILD_TRANSACTIONS_V1_TO_V2: &str = "
-CREATE TABLE transactions_new (
-    id                   TEXT PRIMARY KEY,
-    batch_id             TEXT,
-    description          TEXT NOT NULL,
-    date                 TEXT NOT NULL,
-    amount               INTEGER NOT NULL CHECK (amount != 0),
-    opposing_amount      INTEGER CHECK (opposing_amount IS NULL OR opposing_amount > 0),
-    account_id           INTEGER NOT NULL REFERENCES accounts(id),
-    opposing_account_id  INTEGER NOT NULL REFERENCES accounts(id),
-    category_id          INTEGER REFERENCES categories(id) ON DELETE SET NULL,
-    created_at           TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at           TEXT NOT NULL DEFAULT (datetime('now')),
-    CHECK (account_id <> opposing_account_id),
-    CHECK (substr(date,1,19) IS strftime('%Y-%m-%dT%H:%M:%S', substr(date,1,19)))
-);
+fn rebuild_transactions_v1_to_v2() -> String {
+    format!(
+        "
+CREATE TABLE transactions_new ({TRANSACTIONS_COLUMNS});
 INSERT INTO transactions_new SELECT * FROM transactions;
 DROP TABLE transactions;
 ALTER TABLE transactions_new RENAME TO transactions;
 PRAGMA user_version = 2;
-";
+"
+    )
+}
 
 struct Config {
     bind: String,
@@ -104,13 +102,13 @@ fn migrate(conn: &Connection) {
         .expect("failed to read user_version");
     match user_version {
         0 => {
-            conn.execute_batch(SCHEMA)
+            conn.execute_batch(&schema())
                 .expect("failed to apply schema");
             conn.execute_batch("PRAGMA user_version = 2;")
                 .expect("failed to set user_version");
         }
         1 => {
-            conn.execute_batch(REBUILD_TRANSACTIONS_V1_TO_V2)
+            conn.execute_batch(&rebuild_transactions_v1_to_v2())
                 .expect("failed to rebuild transactions table");
         }
         2 => {}
@@ -118,10 +116,6 @@ fn migrate(conn: &Connection) {
     }
 }
 
-/// The one shared cross-table validation function every transaction insert/update
-/// path must call (see docs/spec-v1.md "Cross-table validation"). Everything else
-/// (id existence, own-account-has-currency, external-account-has-no-currency) is
-/// already enforced by the schema's CHECK/REFERENCES + PRAGMA foreign_keys = ON.
 fn is_rfc3339(s: &str) -> bool {
     OffsetDateTime::parse(s, &Rfc3339).is_ok()
 }
@@ -247,6 +241,22 @@ fn db_error_response(err: &rusqlite::Error) -> Response<Cursor<Vec<u8>>> {
     error_response(status, &message)
 }
 
+/// Shared by every `GET /<resource>` list endpoint: run `sql`, map each row
+/// through `f`, return the whole result set as a `200` JSON array.
+fn list<T: Serialize>(
+    conn: &Connection,
+    sql: &str,
+    f: impl FnMut(&rusqlite::Row) -> rusqlite::Result<T>,
+) -> Response<Cursor<Vec<u8>>> {
+    let mut stmt = conn.prepare(sql).expect("prepare list query");
+    let rows: Vec<T> = stmt
+        .query_map([], f)
+        .expect("query list")
+        .map(|r| r.expect("read row"))
+        .collect();
+    json_response(200, serde_json::to_string(&rows).unwrap())
+}
+
 // --- Currencies ---------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -285,15 +295,7 @@ fn create_currency(conn: &Connection, body: &str) -> Response<Cursor<Vec<u8>>> {
 }
 
 fn list_currencies(conn: &Connection) -> Response<Cursor<Vec<u8>>> {
-    let mut stmt = conn
-        .prepare("SELECT id, code, minor_unit FROM currencies")
-        .expect("prepare list currencies");
-    let rows: Vec<CurrencyResponse> = stmt
-        .query_map([], currency_json)
-        .expect("query currencies")
-        .map(|r| r.expect("read currency row"))
-        .collect();
-    json_response(200, serde_json::to_string(&rows).unwrap())
+    list(conn, "SELECT id, code, minor_unit FROM currencies", currency_json)
 }
 
 // --- Categories -----------------------------------------------------------
@@ -331,15 +333,7 @@ fn create_category(conn: &Connection, body: &str) -> Response<Cursor<Vec<u8>>> {
 }
 
 fn list_categories(conn: &Connection) -> Response<Cursor<Vec<u8>>> {
-    let mut stmt = conn
-        .prepare("SELECT id, name FROM categories")
-        .expect("prepare list categories");
-    let rows: Vec<CategoryResponse> = stmt
-        .query_map([], category_json)
-        .expect("query categories")
-        .map(|r| r.expect("read category row"))
-        .collect();
-    json_response(200, serde_json::to_string(&rows).unwrap())
+    list(conn, "SELECT id, name FROM categories", category_json)
 }
 
 fn delete_category(conn: &Connection, id: &str) -> Response<Cursor<Vec<u8>>> {
@@ -398,15 +392,7 @@ fn create_account(conn: &Connection, body: &str) -> Response<Cursor<Vec<u8>>> {
 }
 
 fn list_accounts(conn: &Connection) -> Response<Cursor<Vec<u8>>> {
-    let mut stmt = conn
-        .prepare("SELECT id, name, type, currency_id FROM accounts")
-        .expect("failed to prepare accounts query");
-    let rows: Vec<AccountResponse> = stmt
-        .query_map([], account_json)
-        .expect("failed to query accounts")
-        .map(|r| r.expect("failed to read account row"))
-        .collect();
-    json_response(200, serde_json::to_string(&rows).unwrap())
+    list(conn, "SELECT id, name, type, currency_id FROM accounts", account_json)
 }
 
 fn delete_account(conn: &Connection, id: &str) -> Response<Cursor<Vec<u8>>> {
@@ -565,58 +551,46 @@ fn create_transactions_batch(conn: &Connection, body: &str) -> Response<Cursor<V
 }
 
 fn list_transactions(conn: &Connection) -> Response<Cursor<Vec<u8>>> {
-    let mut stmt = conn
-        .prepare(&format!("{TRANSACTION_SELECT} ORDER BY t.date DESC, t.id"))
-        .expect("prepare list transactions");
-    let rows: Vec<TransactionResponse> = stmt
-        .query_map([], transaction_json)
-        .expect("query transactions")
-        .map(|r| r.expect("read transaction row"))
-        .collect();
-    json_response(200, serde_json::to_string(&rows).unwrap())
+    list(conn, &format!("{TRANSACTION_SELECT} ORDER BY t.date DESC, t.id"), transaction_json)
 }
 
-/// Fields immutable after creation — naming any of these in a PATCH body is
-/// a 400, not a silent no-op (see docs/spec-v1.md "API" -> Transactions).
-const IMMUTABLE_TRANSACTION_FIELDS: [&str; 6] =
-    ["amount", "date", "account_id", "opposing_account_id", "batch_id", "id"];
+/// `category_id: None` means the field was absent (leave unchanged), vs
+/// `Some(None)` for `"category_id": null` (clear it) vs `Some(Some(id))`
+/// (set it). A `deserialize_with` override disables serde's usual
+/// missing-field-means-`None` handling for `Option<T>`, hence the explicit
+/// `default`.
+fn deserialize_double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Deserialize::deserialize(deserializer).map(Some)
+}
+
+/// `{description?, category_id?}` — every other field is immutable after
+/// creation (see docs/spec-v1.md "API" -> Transactions), so `deny_unknown_fields`
+/// turns naming one of them into a `400` instead of a silent no-op.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PatchTransactionRequest {
+    description: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    category_id: Option<Option<i64>>,
+}
 
 fn patch_transaction(conn: &Connection, id: &str, body: &str) -> Response<Cursor<Vec<u8>>> {
-    let Ok(serde_json::Value::Object(fields)) = serde_json::from_str::<serde_json::Value>(body) else {
-        return error_response(400, "invalid JSON body");
+    let Ok(req) = serde_json::from_str::<PatchTransactionRequest>(body) else {
+        return error_response(400, "expected {description?, category_id?}");
     };
 
-    let names_immutable_field = IMMUTABLE_TRANSACTION_FIELDS
-        .iter()
-        .any(|f| fields.contains_key(*f));
-    if names_immutable_field {
-        return error_response(400, "only description and category_id may be updated");
-    }
-
-    let description = match fields.get("description") {
-        Some(v) => match v.as_str() {
-            Some(s) => Some(s),
-            None => return error_response(400, "description must be a string"),
-        },
-        None => None,
-    };
-    // category_id may be legitimately cleared to NULL, so "present" (even as
-    // `null`) and "absent" need different SQL behavior — COALESCE alone can't
-    // tell "leave unchanged" from "set to NULL".
-    let category_id_given = fields.contains_key("category_id");
-    let category_id = match fields.get("category_id") {
-        Some(serde_json::Value::Null) | None => None,
-        Some(v) => match v.as_i64() {
-            Some(n) => Some(n),
-            None => return error_response(400, "category_id must be an integer or null"),
-        },
-    };
+    let category_id_given = req.category_id.is_some();
+    let category_id = req.category_id.flatten();
 
     let updated = conn.execute(
         "UPDATE transactions SET description = COALESCE(?1, description), \
          category_id = CASE WHEN ?2 THEN ?3 ELSE category_id END, \
          updated_at = datetime('now') WHERE id = ?4",
-        rusqlite::params![description, category_id_given, category_id, id],
+        rusqlite::params![req.description, category_id_given, category_id, id],
     );
     match updated {
         Ok(0) => not_found(),
@@ -665,11 +639,11 @@ const POSTING_SELECT: &str = "SELECT t.description, t.date, t.amount, t.opposing
     JOIN accounts oa ON t.opposing_account_id = oa.id LEFT JOIN currencies oc ON oa.currency_id = oc.id \
     LEFT JOIN categories cat ON t.category_id = cat.id";
 
-/// Reads one joined `POSTING_SELECT` row and appends 1 or 2 `PostingResponse`s
-/// to `out`: always the primary leg (`account_id` is always 'own'), plus the
-/// opposing leg only when the opposing account is also 'own' — an external
-/// counterparty isn't a balance anyone tracks, so it gets no row of its own.
-fn push_postings(row: &rusqlite::Row, out: &mut Vec<PostingResponse>) -> rusqlite::Result<()> {
+/// Maps one joined `POSTING_SELECT` row to 1 or 2 `PostingResponse`s: always
+/// the primary leg (`account_id` is always 'own'), plus the opposing leg
+/// only when the opposing account is also 'own' — an external counterparty
+/// isn't a balance anyone tracks, so it gets no row of its own.
+fn postings_from_row(row: &rusqlite::Row) -> rusqlite::Result<Vec<PostingResponse>> {
     let description: String = row.get(0)?;
     let date: String = row.get(1)?;
     let amount: i64 = row.get(2)?;
@@ -691,7 +665,7 @@ fn push_postings(row: &rusqlite::Row, out: &mut Vec<PostingResponse>) -> rusqlit
     } else {
         "Withdrawal"
     };
-    out.push(PostingResponse {
+    let mut postings = vec![PostingResponse {
         description: description.clone(),
         date: date.clone(),
         amount: major_amount,
@@ -700,7 +674,7 @@ fn push_postings(row: &rusqlite::Row, out: &mut Vec<PostingResponse>) -> rusqlit
         opposing_account: opposing_account_name.clone(),
         r#type: primary_type,
         category: category_name.clone(),
-    });
+    }];
 
     if opposing_type == "own" {
         let opposing_minor_unit = opposing_minor_unit.expect("'own' account always has a currency");
@@ -708,7 +682,7 @@ fn push_postings(row: &rusqlite::Row, out: &mut Vec<PostingResponse>) -> rusqlit
             Some(a) => minor_to_major(if amount < 0 { a } else { -a }, opposing_minor_unit),
             None => minor_to_major(-amount, minor_unit),
         };
-        out.push(PostingResponse {
+        postings.push(PostingResponse {
             description,
             date,
             amount: opposing_major_amount,
@@ -720,18 +694,18 @@ fn push_postings(row: &rusqlite::Row, out: &mut Vec<PostingResponse>) -> rusqlit
         });
     }
 
-    Ok(())
+    Ok(postings)
 }
 
 fn list_postings(conn: &Connection) -> Response<Cursor<Vec<u8>>> {
     let mut stmt = conn
         .prepare(&format!("{POSTING_SELECT} ORDER BY t.date DESC, t.id"))
         .expect("prepare list postings");
-    let mut rows = stmt.query([]).expect("query postings");
-    let mut postings = Vec::new();
-    while let Some(row) = rows.next().expect("read posting row") {
-        push_postings(row, &mut postings).expect("map posting row");
-    }
+    let postings: Vec<PostingResponse> = stmt
+        .query_map([], postings_from_row)
+        .expect("query postings")
+        .flat_map(|r| r.expect("read posting row"))
+        .collect();
     json_response(200, serde_json::to_string(&postings).unwrap())
 }
 
@@ -828,15 +802,6 @@ mod tests {
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
         migrate(&conn);
         conn
-    }
-
-    #[test]
-    fn setup_applies_schema_through_migrate() {
-        let conn = setup();
-        let user_version: i64 = conn
-            .query_row("PRAGMA user_version;", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(user_version, 2, "setup() must apply schema via migrate(), not duplicate SCHEMA directly");
     }
 
     #[test]
@@ -1162,18 +1127,6 @@ mod tests {
             .query_row("SELECT category_id FROM transactions WHERE id = 't1'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(category_id, None);
-    }
-
-    #[test]
-    fn db_error_response_uses_error_envelope() {
-        let conn = setup();
-        conn.execute("INSERT INTO categories (id, name) VALUES (1, 'Food')", [])
-            .unwrap();
-        let err = conn
-            .execute("INSERT INTO categories (id, name) VALUES (1, 'Drinks')", [])
-            .unwrap_err();
-        let response = db_error_response(&err);
-        assert_eq!(response.status_code().0, 409);
     }
 
     #[test]

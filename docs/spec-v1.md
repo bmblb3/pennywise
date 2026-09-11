@@ -100,30 +100,7 @@ HTTP + JSON. No filtering, no pagination, no aggregation on any endpoint — a l
 
 Standard envelope: `{"error": "<message>"}` on failure. Status codes: `201` create, `200` read, `204` delete, `400` validation failure (including a `CHECK`/`FK` violation surfaced from SQLite, and an attempt to `PATCH` an immutable field), `404` unknown id, `409` duplicate `id` on insert (primary-key conflict — this **is** the dedup mechanism; don't build a second one).
 
-### Currencies
-
-- `POST /currencies` — `{code, minor_unit}`
-- `GET /currencies` — full list
-
-### Accounts
-
-- `POST /accounts` — `{name, type, currency_id?}`, validated against the schema's `own`/`external` `CHECK`
-- `GET /accounts` — full list
-- `DELETE /accounts/{id}` — `400` if any transaction still references it (native FK rejection)
-
-### Categories
-
-- `POST /categories` — `{name}`
-- `GET /categories` — full list
-- `DELETE /categories/{id}` — referencing transactions have `category_id` set to `NULL` (native, via `ON DELETE SET NULL`)
-
-### Transactions
-
-- `POST /transactions` — one transaction; runs the shared validation function
-- `POST /transactions/batch` — `{batch_id, transactions: [...]}`; every item shares `batch_id` and is run through the same validation function; the whole batch is one SQLite transaction, so a single invalid or duplicate row rolls back the entire batch rather than partially importing it
-- `GET /transactions` — full list, ordered by `date DESC, id`
-- `PATCH /transactions/{id}` — `{description?, category_id?}` only. `amount`, `date`, `account_id`, `opposing_account_id`, `batch_id`, and `id` are immutable; a request naming any of them is a `400`, not a silent no-op. Sets `updated_at` to now.
-- `DELETE /transactions/{id}` — removes the row outright (distinct from editing a structural field, so it doesn't conflict with the immutability rule above). No tombstone: `id` is freed, so re-importing the same source file re-creates a deliberately deleted Transaction (it hits the same `id`, so the 409 dedup path no longer applies). Accepted, see `CONTEXT.md` under Transaction.
+The endpoint inventory (paths, request/response shapes, per-endpoint status codes) lives in `docs/openapi.yaml`, the machine-readable source of truth — don't restate it here. Update it in the same commit as any change to an endpoint's shape or behavior.
 
 ## Implementation
 
