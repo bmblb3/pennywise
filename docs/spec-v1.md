@@ -90,6 +90,8 @@ Not expressible as SQLite `CHECK` constraints (they span rows/tables). Implement
 1. `account_id` must reference an account with `type = 'own'`.
 2. `opposing_amount` is required if and only if both `account_id` and `opposing_account_id` are `type = 'own'` and their currencies differ. It is otherwise `NULL`. When present, it is the magnitude on the opposing side only — its sign is always inferred from `amount`'s sign, never stored separately.
 
+The relationship between `amount` and `opposing_amount` on a cross-currency Transfer — i.e. the implied exchange rate — is deliberately unvalidated. Nothing checks it's a plausible rate; a scale error (e.g. an import feeding major units where minor units were expected) is accepted same as a correct pair. No information is lost (the pair is always recoverable), and there is no rate source in this project to validate against (multi-currency net worth/exchange-rate fetching is an explicit non-goal). The owner is responsible for the pair being sane, same trust level as `description`.
+
 Everything else (an account/category id existing at all, an `own` account having a currency, an `external` account not having one) is already enforced natively by the schema's `CHECK`/`REFERENCES` clauses plus `PRAGMA foreign_keys = ON` — don't re-implement it in application code.
 
 ## API
