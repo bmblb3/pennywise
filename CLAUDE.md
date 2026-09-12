@@ -16,7 +16,7 @@ Single-context: one `CONTEXT.md` and one `docs/adr/` at the repo root, both crea
 
 ### Docs stay in sync
 
-When a change alters an endpoint's request/response shape or behavior, update `docs/openapi.yaml` in the same commit. If it also changes the storage contract or a cross-table invariant, update `docs/spec-v1.md` too. Don't leave doc updates for a follow-up.
+When a change alters an endpoint's request/response shape or behavior, update `docs/openapi.json` in the same commit. If it also changes the storage contract or a cross-table invariant, update `docs/spec-v1.md` too. Don't leave doc updates for a follow-up.
 
 ### Coding posture
 

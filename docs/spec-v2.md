@@ -4,7 +4,7 @@ v2 makes three additions on top of [v1](spec-v1.md) — `GET /balances`, piggy b
 
 > **Draft.** Sections land one at a time and get reconciled into a single document (naming, ordering, updated non-goals) once all four are written.
 
-`docs/openapi.yaml` documents the API as it is actually served, so it is **not** updated ahead of implementation — each v2 endpoint lands there in the commit that builds it. Until then the request/response shapes live here, which is why this spec states them inline rather than deferring to the OpenAPI document the way v1 does.
+`docs/openapi.json` documents the API as it is actually served, so it is **not** updated ahead of implementation — each v2 endpoint lands there in the commit that builds it. Until then the request/response shapes live here, which is why this spec states them inline rather than deferring to the OpenAPI document the way v1 does.
 
 ## API
 

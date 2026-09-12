@@ -9,6 +9,7 @@ RUN cargo install cargo-chef --locked
 FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY docs ./docs
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
@@ -18,6 +19,7 @@ COPY --from=planner /build/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY docs ./docs
 RUN cargo build --release
 
 FROM debian:bookworm-slim

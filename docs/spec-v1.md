@@ -100,7 +100,7 @@ HTTP + JSON. No filtering, no pagination, no aggregation on any endpoint — a l
 
 Standard envelope: `{"error": "<message>"}` on failure. Status codes: `201` create, `200` read, `204` delete, `400` validation failure (including a `CHECK`/`FK` violation surfaced from SQLite, and an attempt to `PATCH` an immutable field), `404` unknown id, `409` duplicate `id` on insert (primary-key conflict — this **is** the dedup mechanism; don't build a second one).
 
-The endpoint inventory (paths, request/response shapes, per-endpoint status codes) lives in `docs/openapi.yaml`, the machine-readable source of truth — don't restate it here. Update it in the same commit as any change to an endpoint's shape or behavior.
+The endpoint inventory (paths, request/response shapes, per-endpoint status codes) lives in `docs/openapi.json`, the machine-readable source of truth — don't restate it here. Update it in the same commit as any change to an endpoint's shape or behavior.
 
 ## Implementation
 

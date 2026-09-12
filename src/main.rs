@@ -815,6 +815,10 @@ fn route(conn: &Connection, method: &Method, path: &str, body: &str) -> Response
 
         (Method::Get, ["balances"]) => list_balances(conn),
 
+        (Method::Get, ["openapi.json"]) => {
+            json_response(200, include_str!("../docs/openapi.json").to_string())
+        }
+
         _ => not_found(),
     }
 }
