@@ -23,7 +23,7 @@ _Avoid_: denomination
 ## The ledger
 
 **Ledger**:
-The complete record of Transactions.
+The record of real-money Transactions — every Transaction except Envelope funding, which reserves money in place without moving it. Exposed via `GET /ledger`.
 _Avoid_: history, journal, book, log
 
 **Transaction**:
@@ -49,3 +49,7 @@ _Avoid_: internal payment, self-payment
 **Category**:
 The classification attached to a Transaction for the owner's own reference. Purely descriptive — nothing in the Ledger depends on it being set or correct.
 _Avoid_: tag, label, bucket, type
+
+**Envelope**:
+A named, virtual reservation of money already sitting in one or more Own Accounts — never a place money moves to. Funding an Envelope is a Transaction whose Opposing Account is the reserved sentinel External Account (id `0`, name "Envelope"); it reserves money in the Transaction's own Account without moving it, so it never appears in the Ledger. An Envelope's balance (funded minus spent) is computed per Own Account touched, never summed across Accounts — a reservation can span Accounts of different Currencies. Deleting an Envelope any Transaction still references is rejected, same as an Account.
+_Avoid_: piggy bank, budget, pot, bucket, goal
