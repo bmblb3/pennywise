@@ -5,23 +5,32 @@ use std::io::Cursor;
 use tiny_http::{Header, Method, Response, Server};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-/// Column/constraint list shared by a fresh `transactions` table and the
-/// v1->v2 rebuild below, so the two can't drift apart from each other.
+/// Column/constraint list for a fresh `transactions` table (v3 shape: no
+/// `batch_id`, `envelope_id`/`is_funding` added, `category_id` RESTRICT not
+/// SET NULL — see docs/spec-v2.md "Envelopes"). Shared by `schema()` and
+/// `migrate_v2_to_v3()`'s rebuild so the two can't drift apart.
 const TRANSACTIONS_COLUMNS: &str = "
     id                   TEXT PRIMARY KEY,
-    batch_id             TEXT,
     description          TEXT NOT NULL,
     date                 TEXT NOT NULL,
     amount               INTEGER NOT NULL CHECK (amount != 0),
     opposing_amount      INTEGER CHECK (opposing_amount IS NULL OR opposing_amount > 0),
     account_id           INTEGER NOT NULL REFERENCES accounts(id),
     opposing_account_id  INTEGER NOT NULL REFERENCES accounts(id),
-    category_id          INTEGER REFERENCES categories(id) ON DELETE SET NULL,
+    category_id          INTEGER REFERENCES categories(id),
+    envelope_id          INTEGER REFERENCES envelopes(id),
+    is_funding           GENERATED ALWAYS AS (opposing_account_id = 0) VIRTUAL,
     created_at           TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at           TEXT NOT NULL DEFAULT (datetime('now')),
     CHECK (account_id <> opposing_account_id),
     CHECK (substr(date,1,19) IS strftime('%Y-%m-%dT%H:%M:%S', substr(date,1,19)))
 ";
+
+/// The sentinel External Account (id `0`) that an Envelope-funding Transaction
+/// reserves money against — seeded once, before any user-created account can
+/// claim id `0`. See docs/adr/0004-envelope-funding-via-sentinel-account.md.
+const SEED_SENTINEL_ACCOUNT: &str =
+    "INSERT INTO accounts (id, name, type, currency_id) VALUES (0, 'Envelope', 'external', NULL);";
 
 fn schema() -> String {
     format!(
@@ -45,7 +54,14 @@ CREATE TABLE accounts (
 
 CREATE UNIQUE INDEX accounts_name_type ON accounts (name, type);
 
+{SEED_SENTINEL_ACCOUNT}
+
 CREATE TABLE categories (
+    id   INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE envelopes (
     id   INTEGER PRIMARY KEY,
     name TEXT NOT NULL UNIQUE
 );
@@ -56,15 +72,56 @@ CREATE TABLE transactions ({TRANSACTIONS_COLUMNS});
 }
 
 /// 12-step table rebuild adding the two CHECKs above to a `transactions` table
-/// created before they existed (SQLite can't ALTER TABLE ... ADD CHECK).
+/// created before they existed (SQLite can't ALTER TABLE ... ADD CHECK). This
+/// is the frozen v1->v2 column shape (still has `batch_id`, still
+/// `category_id ON DELETE SET NULL`) — v2's own changes are a separate step,
+/// `migrate_v2_to_v3`, below.
 fn rebuild_transactions_v1_to_v2() -> String {
-    format!(
-        "
-CREATE TABLE transactions_new ({TRANSACTIONS_COLUMNS});
+    "
+CREATE TABLE transactions_new (
+    id                   TEXT PRIMARY KEY,
+    batch_id             TEXT,
+    description          TEXT NOT NULL,
+    date                 TEXT NOT NULL,
+    amount               INTEGER NOT NULL CHECK (amount != 0),
+    opposing_amount      INTEGER CHECK (opposing_amount IS NULL OR opposing_amount > 0),
+    account_id           INTEGER NOT NULL REFERENCES accounts(id),
+    opposing_account_id  INTEGER NOT NULL REFERENCES accounts(id),
+    category_id          INTEGER REFERENCES categories(id) ON DELETE SET NULL,
+    created_at           TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at           TEXT NOT NULL DEFAULT (datetime('now')),
+    CHECK (account_id <> opposing_account_id),
+    CHECK (substr(date,1,19) IS strftime('%Y-%m-%dT%H:%M:%S', substr(date,1,19)))
+);
 INSERT INTO transactions_new SELECT * FROM transactions;
 DROP TABLE transactions;
 ALTER TABLE transactions_new RENAME TO transactions;
 PRAGMA user_version = 2;
+"
+    .to_string()
+}
+
+/// v2's schema changes (docs/spec-v2.md "Envelopes" / "Removed" -> `batch_id`):
+/// adds `envelopes` and the sentinel Account, then rebuilds `transactions` to
+/// drop `batch_id`, add `envelope_id`/`is_funding`, and flip `category_id`
+/// from `ON DELETE SET NULL` to implicit RESTRICT (ADR 0005) — a rebuild
+/// because SQLite can't ALTER an existing column's REFERENCES clause.
+fn migrate_v2_to_v3() -> String {
+    format!(
+        "
+CREATE TABLE envelopes (
+    id   INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE
+);
+
+{SEED_SENTINEL_ACCOUNT}
+
+CREATE TABLE transactions_new ({TRANSACTIONS_COLUMNS});
+INSERT INTO transactions_new (id, description, date, amount, opposing_amount, account_id, opposing_account_id, category_id, created_at, updated_at)
+    SELECT id, description, date, amount, opposing_amount, account_id, opposing_account_id, category_id, created_at, updated_at FROM transactions;
+DROP TABLE transactions;
+ALTER TABLE transactions_new RENAME TO transactions;
+PRAGMA user_version = 3;
 "
     )
 }
@@ -97,23 +154,33 @@ fn open_db(path: &str) -> Connection {
     conn
 }
 
+/// Migrates one version at a time, re-reading `user_version` after each step,
+/// until the schema is current. A loop rather than v1's single match+return:
+/// v1's own spec calls for a real framework "at migration three, not
+/// migration one" (docs/spec-v1.md "Migrations") — this is migration three.
 fn migrate(conn: &Connection) {
-    let user_version: i64 = conn
-        .query_row("PRAGMA user_version;", [], |row| row.get(0))
-        .expect("failed to read user_version");
-    match user_version {
-        0 => {
-            conn.execute_batch(&schema())
-                .expect("failed to apply schema");
-            conn.execute_batch("PRAGMA user_version = 2;")
-                .expect("failed to set user_version");
+    loop {
+        let user_version: i64 = conn
+            .query_row("PRAGMA user_version;", [], |row| row.get(0))
+            .expect("failed to read user_version");
+        match user_version {
+            0 => {
+                conn.execute_batch(&schema())
+                    .expect("failed to apply schema");
+                conn.execute_batch("PRAGMA user_version = 3;")
+                    .expect("failed to set user_version");
+            }
+            1 => {
+                conn.execute_batch(&rebuild_transactions_v1_to_v2())
+                    .expect("failed to rebuild transactions table (v1 -> v2)");
+            }
+            2 => {
+                conn.execute_batch(&migrate_v2_to_v3())
+                    .expect("failed to rebuild transactions table (v2 -> v3)");
+            }
+            3 => break,
+            other => panic!("unknown database schema version: {other}"),
         }
-        1 => {
-            conn.execute_batch(&rebuild_transactions_v1_to_v2())
-                .expect("failed to rebuild transactions table");
-        }
-        2 => {}
-        other => panic!("unknown database schema version: {other}"),
     }
 }
 
@@ -349,17 +416,70 @@ fn list_categories(conn: &Connection) -> Response<Cursor<Vec<u8>>> {
     list(conn, "SELECT id, name FROM categories", category_json)
 }
 
+/// `category_id` is RESTRICT, not SET NULL, as of v2 (ADR 0005) — a category
+/// still referenced by any transaction fails with 400 (native FK rejection),
+/// same as `delete_account`.
 fn delete_category(conn: &Connection, id: &str) -> Response<Cursor<Vec<u8>>> {
     let Ok(id) = id.parse::<i64>() else {
         return not_found();
     };
-    let deleted = conn
-        .execute("DELETE FROM categories WHERE id = ?1", [id])
-        .expect("delete category");
-    if deleted == 0 {
-        not_found()
-    } else {
-        Response::from_string("").with_status_code(204)
+    match conn.execute("DELETE FROM categories WHERE id = ?1", [id]) {
+        Ok(0) => not_found(),
+        Ok(_) => Response::from_string("").with_status_code(204),
+        Err(e) => db_error_response(&e),
+    }
+}
+
+// --- Envelopes --------------------------------------------------------------
+//
+// CRUD mirrors Categories exactly. Funding one has no dedicated endpoint —
+// it's a plain POST /transactions with opposing_account_id: 0 (see
+// insert_transaction below). Delete is RESTRICT, same as Category (ADR 0005).
+
+#[derive(Deserialize)]
+struct CreateEnvelopeRequest {
+    name: String,
+}
+
+#[derive(Serialize)]
+struct EnvelopeResponse {
+    id: i64,
+    name: String,
+}
+
+fn envelope_json(row: &rusqlite::Row) -> rusqlite::Result<EnvelopeResponse> {
+    Ok(EnvelopeResponse {
+        id: row.get(0)?,
+        name: row.get(1)?,
+    })
+}
+
+fn create_envelope(conn: &Connection, body: &str) -> Response<Cursor<Vec<u8>>> {
+    let Ok(req) = serde_json::from_str::<CreateEnvelopeRequest>(body) else {
+        return error_response(400, "expected {name}");
+    };
+    match conn.query_row(
+        "INSERT INTO envelopes (name) VALUES (?1) RETURNING id, name",
+        [req.name],
+        envelope_json,
+    ) {
+        Ok(row) => json_response(201, serde_json::to_string(&row).unwrap()),
+        Err(err) => db_error_response(&err),
+    }
+}
+
+fn list_envelopes(conn: &Connection) -> Response<Cursor<Vec<u8>>> {
+    list(conn, "SELECT id, name FROM envelopes", envelope_json)
+}
+
+fn delete_envelope(conn: &Connection, id: &str) -> Response<Cursor<Vec<u8>>> {
+    let Ok(id) = id.parse::<i64>() else {
+        return not_found();
+    };
+    match conn.execute("DELETE FROM envelopes WHERE id = ?1", [id]) {
+        Ok(0) => not_found(),
+        Ok(_) => Response::from_string("").with_status_code(204),
+        Err(e) => db_error_response(&e),
     }
 }
 
@@ -424,7 +544,6 @@ fn delete_account(conn: &Connection, id: &str) -> Response<Cursor<Vec<u8>>> {
 #[derive(Deserialize)]
 struct CreateTransactionRequest {
     id: String,
-    batch_id: Option<String>,
     description: String,
     date: String,
     amount: f64,
@@ -432,18 +551,17 @@ struct CreateTransactionRequest {
     account_id: i64,
     opposing_account_id: i64,
     category_id: Option<i64>,
+    envelope_id: Option<i64>,
 }
 
 #[derive(Deserialize)]
 struct CreateTransactionsBatchRequest {
-    batch_id: String,
     transactions: Vec<CreateTransactionRequest>,
 }
 
 #[derive(Serialize)]
 struct TransactionResponse {
     id: String,
-    batch_id: Option<String>,
     description: String,
     date: String,
     amount: f64,
@@ -451,6 +569,7 @@ struct TransactionResponse {
     account_id: i64,
     opposing_account_id: i64,
     category_id: Option<i64>,
+    envelope_id: Option<i64>,
     created_at: String,
     updated_at: String,
 }
@@ -460,21 +579,21 @@ struct TransactionResponse {
 /// REST-facing major units here so every read path (insert/list/patch) goes
 /// through one place.
 fn transaction_json(row: &rusqlite::Row) -> rusqlite::Result<TransactionResponse> {
-    let amount: i64 = row.get(4)?;
-    let opposing_amount: Option<i64> = row.get(5)?;
+    let amount: i64 = row.get(3)?;
+    let opposing_amount: Option<i64> = row.get(4)?;
     let account_minor_unit: i64 = row.get(11)?;
     let opposing_minor_unit: Option<i64> = row.get(12)?;
     Ok(TransactionResponse {
         id: row.get(0)?,
-        batch_id: row.get(1)?,
-        description: row.get(2)?,
-        date: row.get(3)?,
+        description: row.get(1)?,
+        date: row.get(2)?,
         amount: minor_to_major(amount, account_minor_unit),
         opposing_amount: opposing_amount
             .map(|a| minor_to_major(a, opposing_minor_unit.expect("opposing_amount implies an opposing currency"))),
-        account_id: row.get(6)?,
-        opposing_account_id: row.get(7)?,
-        category_id: row.get(8)?,
+        account_id: row.get(5)?,
+        opposing_account_id: row.get(6)?,
+        category_id: row.get(7)?,
+        envelope_id: row.get(8)?,
         created_at: row.get(9)?,
         updated_at: row.get(10)?,
     })
@@ -482,24 +601,18 @@ fn transaction_json(row: &rusqlite::Row) -> rusqlite::Result<TransactionResponse
 
 /// `transaction_json` reader, joined to both legs' currencies so their
 /// `minor_unit` is available for the minor→major conversion at read time.
-const TRANSACTION_SELECT: &str = "SELECT t.id, t.batch_id, t.description, t.date, t.amount, t.opposing_amount, \
-    t.account_id, t.opposing_account_id, t.category_id, t.created_at, t.updated_at, \
+const TRANSACTION_SELECT: &str = "SELECT t.id, t.description, t.date, t.amount, t.opposing_amount, \
+    t.account_id, t.opposing_account_id, t.category_id, t.envelope_id, t.created_at, t.updated_at, \
     ac.minor_unit, oc.minor_unit \
     FROM transactions t \
     JOIN accounts a ON t.account_id = a.id JOIN currencies ac ON a.currency_id = ac.id \
     JOIN accounts oa ON t.opposing_account_id = oa.id LEFT JOIN currencies oc ON oa.currency_id = oc.id";
 
 /// Shared by `POST /transactions` and each item of `POST /transactions/batch`.
-/// `forced_batch_id` overrides any `batch_id` on `req` — every row in a
-/// batch shares the request's top-level `batch_id`, regardless of what an
-/// individual item says.
 fn insert_transaction(
     conn: &Connection,
     req: CreateTransactionRequest,
-    forced_batch_id: Option<&str>,
 ) -> Result<TransactionResponse, Response<Cursor<Vec<u8>>>> {
-    let batch_id = forced_batch_id.map(str::to_string).or(req.batch_id);
-
     let minor_unit = account_minor_unit(conn, req.account_id).map_err(|e| error_response(400, &e))?;
     let amount = major_to_minor(req.amount, minor_unit).map_err(|e| error_response(400, &e))?;
     let opposing_amount = req
@@ -519,9 +632,9 @@ fn insert_transaction(
     }
 
     conn.execute(
-        "INSERT INTO transactions (id, batch_id, description, date, amount, opposing_amount, account_id, opposing_account_id, category_id)
+        "INSERT INTO transactions (id, description, date, amount, opposing_amount, account_id, opposing_account_id, category_id, envelope_id)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        rusqlite::params![req.id, batch_id, req.description, req.date, amount, opposing_amount, req.account_id, req.opposing_account_id, req.category_id],
+        rusqlite::params![req.id, req.description, req.date, amount, opposing_amount, req.account_id, req.opposing_account_id, req.category_id, req.envelope_id],
     )
     .map_err(|e| db_error_response(&e))?;
 
@@ -536,7 +649,7 @@ fn create_transaction(conn: &Connection, body: &str) -> Response<Cursor<Vec<u8>>
             "expected {id, description, date, amount, account_id, opposing_account_id}",
         );
     };
-    match insert_transaction(conn, req, None) {
+    match insert_transaction(conn, req) {
         Ok(txn) => json_response(201, serde_json::to_string(&txn).unwrap()),
         Err(resp) => resp,
     }
@@ -544,7 +657,7 @@ fn create_transaction(conn: &Connection, body: &str) -> Response<Cursor<Vec<u8>>
 
 fn create_transactions_batch(conn: &Connection, body: &str) -> Response<Cursor<Vec<u8>>> {
     let Ok(req) = serde_json::from_str::<CreateTransactionsBatchRequest>(body) else {
-        return error_response(400, "expected {batch_id, transactions: [...]}");
+        return error_response(400, "expected {transactions: [...]}");
     };
 
     // Connection::transaction() rolls back on Drop unless committed, so a
@@ -553,7 +666,7 @@ fn create_transactions_batch(conn: &Connection, body: &str) -> Response<Cursor<V
 
     let mut created = Vec::new();
     for item in req.transactions {
-        match insert_transaction(&txn, item, Some(&req.batch_id)) {
+        match insert_transaction(&txn, item) {
             Ok(row) => created.push(row),
             Err(resp) => return resp,
         }
@@ -623,16 +736,18 @@ fn delete_transaction(conn: &Connection, id: &str) -> Response<Cursor<Vec<u8>>> 
     }
 }
 
-// --- Postings ---------------------------------------------------------------
+// --- Ledger -------------------------------------------------------------
 //
 // A flat, self-contained double-entry view for downstream aggregation (jq
 // balances/expenses/income by account/category/date/sign) without any
 // server-side filtering: each transaction becomes one row per *tracked* (own)
 // account it touches, already correctly signed and named, so no client-side
-// sign inference or id-joining is needed.
+// sign inference or id-joining is needed. Renamed from GET /postings in v2:
+// Envelope-funding rows (`is_funding`) are excluded — they reserve money in
+// place rather than moving it, so they aren't real money movement (ADR 0004).
 
 #[derive(Serialize)]
-struct PostingResponse {
+struct LedgerResponse {
     description: String,
     date: String,
     amount: f64,
@@ -643,20 +758,21 @@ struct PostingResponse {
     category: Option<String>,
 }
 
-const POSTING_SELECT: &str = "SELECT t.description, t.date, t.amount, t.opposing_amount, \
+const LEDGER_SELECT: &str = "SELECT t.description, t.date, t.amount, t.opposing_amount, \
     a.name, ac.code, ac.minor_unit, \
     oa.name, oa.type, oc.code, oc.minor_unit, \
     cat.name \
     FROM transactions t \
     JOIN accounts a ON t.account_id = a.id JOIN currencies ac ON a.currency_id = ac.id \
     JOIN accounts oa ON t.opposing_account_id = oa.id LEFT JOIN currencies oc ON oa.currency_id = oc.id \
-    LEFT JOIN categories cat ON t.category_id = cat.id";
+    LEFT JOIN categories cat ON t.category_id = cat.id \
+    WHERE NOT t.is_funding";
 
-/// Maps one joined `POSTING_SELECT` row to 1 or 2 `PostingResponse`s: always
+/// Maps one joined `LEDGER_SELECT` row to 1 or 2 `LedgerResponse`s: always
 /// the primary leg (`account_id` is always 'own'), plus the opposing leg
 /// only when the opposing account is also 'own' — an external counterparty
 /// isn't a balance anyone tracks, so it gets no row of its own.
-fn postings_from_row(row: &rusqlite::Row) -> rusqlite::Result<Vec<PostingResponse>> {
+fn ledger_from_row(row: &rusqlite::Row) -> rusqlite::Result<Vec<LedgerResponse>> {
     let description: String = row.get(0)?;
     let date: String = row.get(1)?;
     let amount: i64 = row.get(2)?;
@@ -678,7 +794,7 @@ fn postings_from_row(row: &rusqlite::Row) -> rusqlite::Result<Vec<PostingRespons
     } else {
         "Withdrawal"
     };
-    let mut postings = vec![PostingResponse {
+    let mut rows = vec![LedgerResponse {
         description: description.clone(),
         date: date.clone(),
         amount: major_amount,
@@ -693,7 +809,7 @@ fn postings_from_row(row: &rusqlite::Row) -> rusqlite::Result<Vec<PostingRespons
         let opposing_minor_unit = opposing_minor_unit.expect("'own' account always has a currency");
         let opposing_major_amount =
             minor_to_major(transfer_contribution_minor(amount, opposing_amount), opposing_minor_unit);
-        postings.push(PostingResponse {
+        rows.push(LedgerResponse {
             description,
             date,
             amount: opposing_major_amount,
@@ -705,31 +821,33 @@ fn postings_from_row(row: &rusqlite::Row) -> rusqlite::Result<Vec<PostingRespons
         });
     }
 
-    Ok(postings)
+    Ok(rows)
 }
 
-fn list_postings(conn: &Connection) -> Response<Cursor<Vec<u8>>> {
+fn list_ledger(conn: &Connection) -> Response<Cursor<Vec<u8>>> {
     let mut stmt = conn
-        .prepare(&format!("{POSTING_SELECT} ORDER BY t.date DESC, t.id"))
-        .expect("prepare list postings");
-    let postings: Vec<PostingResponse> = stmt
-        .query_map([], postings_from_row)
-        .expect("query postings")
-        .flat_map(|r| r.expect("read posting row"))
+        .prepare(&format!("{LEDGER_SELECT} ORDER BY t.date DESC, t.id"))
+        .expect("prepare list ledger");
+    let rows: Vec<LedgerResponse> = stmt
+        .query_map([], ledger_from_row)
+        .expect("query ledger")
+        .flat_map(|r| r.expect("read ledger row"))
         .collect();
-    json_response(200, serde_json::to_string(&postings).unwrap())
+    json_response(200, serde_json::to_string(&rows).unwrap())
 }
 
 // --- Balances ---------------------------------------------------------------
 //
-// One row per own account, summing the same contributions GET /postings
+// One row per own account, summing the same contributions GET /ledger
 // would emit for it: its own transactions as stored (`transfer_contribution_minor`
-// is the one place that rule lives, shared with `postings_from_row`), plus the
+// is the one place that rule lives, shared with `ledger_from_row`), plus the
 // opposing leg of any own-to-own transfer. Summed in minor units, converted to
 // major units only for the response. Contributions to an external account's id
 // are computed the same as any other but never read back, since only own
 // accounts are queried below — cheaper than filtering the opposing account's
-// type out of the scan.
+// type out of the scan. Excludes Envelope-funding rows, same as GET /ledger:
+// funding reserves money in place rather than moving it, so it must not
+// distort the real balance it's reserved out of (ADR 0004).
 
 #[derive(Serialize)]
 struct BalanceResponse {
@@ -741,7 +859,7 @@ struct BalanceResponse {
 
 fn minor_balances_by_account(conn: &Connection) -> HashMap<i64, i64> {
     let mut stmt = conn
-        .prepare("SELECT account_id, opposing_account_id, amount, opposing_amount FROM transactions")
+        .prepare("SELECT account_id, opposing_account_id, amount, opposing_amount FROM transactions WHERE NOT is_funding")
         .expect("prepare transaction contributions");
     let mut balances: HashMap<i64, i64> = HashMap::new();
     let rows = stmt
@@ -805,13 +923,17 @@ fn route(conn: &Connection, method: &Method, path: &str, body: &str) -> Response
         (Method::Get, ["categories"]) => list_categories(conn),
         (Method::Delete, ["categories", id]) => delete_category(conn, id),
 
+        (Method::Post, ["envelopes"]) => create_envelope(conn, body),
+        (Method::Get, ["envelopes"]) => list_envelopes(conn),
+        (Method::Delete, ["envelopes", id]) => delete_envelope(conn, id),
+
         (Method::Post, ["transactions", "batch"]) => create_transactions_batch(conn, body),
         (Method::Post, ["transactions"]) => create_transaction(conn, body),
         (Method::Get, ["transactions"]) => list_transactions(conn),
         (Method::Patch, ["transactions", id]) => patch_transaction(conn, id, body),
         (Method::Delete, ["transactions", id]) => delete_transaction(conn, id),
 
-        (Method::Get, ["postings"]) => list_postings(conn),
+        (Method::Get, ["ledger"]) => list_ledger(conn),
 
         (Method::Get, ["balances"]) => list_balances(conn),
 
@@ -919,10 +1041,10 @@ mod tests {
         migrate(&conn);
 
         let user_version: i64 = conn.query_row("PRAGMA user_version;", [], |row| row.get(0)).unwrap();
-        assert_eq!(user_version, 2);
+        assert_eq!(user_version, 3, "migrate() runs every pending step, v1 -> v2 -> v3, in one call");
 
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM transactions", [], |r| r.get(0)).unwrap();
-        assert_eq!(count, 1, "pre-existing rows must survive the rebuild");
+        assert_eq!(count, 1, "pre-existing rows must survive both rebuilds");
 
         let err = conn
             .execute(
@@ -1182,8 +1304,10 @@ mod tests {
         assert_eq!(response.status_code().0, 404);
     }
 
+    /// v2 (ADR 0005): `category_id` is RESTRICT, not SET NULL — a referenced
+    /// Category can't be deleted, full stop.
     #[test]
-    fn deleting_category_nulls_referencing_transactions() {
+    fn deleting_referenced_category_is_400_and_leaves_it_set() {
         let conn = setup();
         conn.execute_batch(
             "
@@ -1199,12 +1323,12 @@ mod tests {
         .unwrap();
 
         let response = route(&conn, &Method::Delete, "/categories/1", "");
-        assert_eq!(response.status_code().0, 204);
+        assert_eq!(response.status_code().0, 400);
 
         let category_id: Option<i64> = conn
             .query_row("SELECT category_id FROM transactions WHERE id = 't1'", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(category_id, None);
+        assert_eq!(category_id, Some(1), "rejected delete must not have detached the category");
     }
 
     #[test]
@@ -1309,10 +1433,9 @@ mod tests {
     }
 
     #[test]
-    fn batch_insert_succeeds_and_shares_batch_id() {
+    fn batch_insert_succeeds() {
         let conn = test_db();
         let body = r#"{
-            "batch_id": "b1",
             "transactions": [
                 {"id": "t1", "description": "Coffee", "date": "2024-01-01T12:00:00Z", "amount": -5.00, "account_id": 1, "opposing_account_id": 4},
                 {"id": "t2", "description": "Lunch", "date": "2024-01-02T12:00:00Z", "amount": -10.00, "account_id": 1, "opposing_account_id": 4}
@@ -1321,9 +1444,7 @@ mod tests {
         let response = route(&conn, &Method::Post, "/transactions/batch", body);
         assert_eq!(response.status_code().0, 201);
 
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM transactions WHERE batch_id = 'b1'", [], |r| r.get(0))
-            .unwrap();
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM transactions", [], |r| r.get(0)).unwrap();
         assert_eq!(count, 2);
     }
 
@@ -1331,7 +1452,6 @@ mod tests {
     fn batch_rolls_back_entirely_on_one_invalid_row() {
         let conn = test_db();
         let body = r#"{
-            "batch_id": "b1",
             "transactions": [
                 {"id": "t1", "description": "Coffee", "date": "2024-01-01T12:00:00Z", "amount": -5.00, "account_id": 1, "opposing_account_id": 4},
                 {"id": "t2", "description": "Bad", "date": "2024-01-02T12:00:00Z", "amount": -10.00, "account_id": 4, "opposing_account_id": 1}
@@ -1353,7 +1473,6 @@ mod tests {
         )
         .unwrap();
         let body = r#"{
-            "batch_id": "b1",
             "transactions": [
                 {"id": "t2", "description": "Coffee", "date": "2024-01-02T12:00:00Z", "amount": -5.00, "account_id": 1, "opposing_account_id": 4},
                 {"id": "t1", "description": "Dup", "date": "2024-01-03T12:00:00Z", "amount": -10.00, "account_id": 1, "opposing_account_id": 4}
@@ -1562,23 +1681,23 @@ mod tests {
     }
 
     #[test]
-    fn own_to_external_produces_one_posting_typed_by_sign() {
+    fn own_to_external_produces_one_ledger_row_typed_by_sign() {
         let conn = test_db();
         route(&conn, &Method::Post, "/transactions", TXN_BODY); // -5.00 from account 1 to external account 4
-        let response = route(&conn, &Method::Get, "/postings", "");
+        let response = route(&conn, &Method::Get, "/ledger", "");
         assert_eq!(response.status_code().0, 200);
         let body = response_body(response);
-        let postings: serde_json::Value = serde_json::from_str(&body).unwrap();
-        let postings = postings.as_array().unwrap();
-        assert_eq!(postings.len(), 1, "external counterparty must not get its own posting row");
-        assert_eq!(postings[0]["type"], "Withdrawal");
-        assert_eq!(postings[0]["amount"], -5.0);
-        assert_eq!(postings[0]["account"], "Own SEK A");
-        assert_eq!(postings[0]["opposing_account"], "External");
+        let rows: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), 1, "external counterparty must not get its own row");
+        assert_eq!(rows[0]["type"], "Withdrawal");
+        assert_eq!(rows[0]["amount"], -5.0);
+        assert_eq!(rows[0]["account"], "Own SEK A");
+        assert_eq!(rows[0]["opposing_account"], "External");
     }
 
     #[test]
-    fn own_to_own_same_currency_transfer_produces_two_postings() {
+    fn own_to_own_same_currency_transfer_produces_two_ledger_rows() {
         let conn = test_db();
         conn.execute(
             "INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id) VALUES ('t1', 'Move', '2024-01-01T00:00:00Z', -1000, 1, 2)",
@@ -1586,17 +1705,17 @@ mod tests {
         )
         .unwrap();
 
-        let response = route(&conn, &Method::Get, "/postings", "");
-        let postings: serde_json::Value = serde_json::from_str(&response_body(response)).unwrap();
-        let postings = postings.as_array().unwrap();
-        assert_eq!(postings.len(), 2);
+        let response = route(&conn, &Method::Get, "/ledger", "");
+        let rows: serde_json::Value = serde_json::from_str(&response_body(response)).unwrap();
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), 2);
 
-        let from = postings.iter().find(|p| p["account"] == "Own SEK A").unwrap();
+        let from = rows.iter().find(|p| p["account"] == "Own SEK A").unwrap();
         assert_eq!(from["amount"], -10.0);
         assert_eq!(from["type"], "Transfer");
         assert_eq!(from["opposing_account"], "Own SEK B");
 
-        let to = postings.iter().find(|p| p["account"] == "Own SEK B").unwrap();
+        let to = rows.iter().find(|p| p["account"] == "Own SEK B").unwrap();
         assert_eq!(to["amount"], 10.0);
         assert_eq!(to["type"], "Transfer");
         assert_eq!(to["opposing_account"], "Own SEK A");
@@ -1612,18 +1731,46 @@ mod tests {
         )
         .unwrap();
 
-        let response = route(&conn, &Method::Get, "/postings", "");
-        let postings: serde_json::Value = serde_json::from_str(&response_body(response)).unwrap();
-        let postings = postings.as_array().unwrap();
-        assert_eq!(postings.len(), 2);
+        let response = route(&conn, &Method::Get, "/ledger", "");
+        let rows: serde_json::Value = serde_json::from_str(&response_body(response)).unwrap();
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), 2);
 
-        let from = postings.iter().find(|p| p["account"] == "Own SEK A").unwrap();
+        let from = rows.iter().find(|p| p["account"] == "Own SEK A").unwrap();
         assert_eq!(from["amount"], -5.0);
         assert_eq!(from["currency"], "SEK");
 
-        let to = postings.iter().find(|p| p["account"] == "Own USD").unwrap();
+        let to = rows.iter().find(|p| p["account"] == "Own USD").unwrap();
         assert_eq!(to["amount"], 5.0);
         assert_eq!(to["currency"], "USD");
+    }
+
+    #[test]
+    fn envelope_funding_is_excluded_from_ledger_and_balance() {
+        let conn = test_db();
+        conn.execute("INSERT INTO envelopes (id, name) VALUES (1, 'Groceries')", [])
+            .unwrap();
+        // Fund the envelope from account 1 by transacting against the sentinel account (id 0).
+        conn.execute(
+            "INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id, envelope_id) \
+             VALUES ('fund', 'Fund groceries', '2024-01-01T00:00:00Z', -2000, 1, 0, 1)",
+            [],
+        )
+        .unwrap();
+
+        let ledger: serde_json::Value =
+            serde_json::from_str(&response_body(route(&conn, &Method::Get, "/ledger", ""))).unwrap();
+        assert_eq!(ledger.as_array().unwrap().len(), 0, "funding must not appear in the ledger");
+
+        let balances: serde_json::Value =
+            serde_json::from_str(&response_body(route(&conn, &Method::Get, "/balances", ""))).unwrap();
+        let a = balances.as_array().unwrap().iter().find(|b| b["account_name"] == "Own SEK A").unwrap();
+        assert_eq!(a["balance"], 0.0, "funding must not move the real account balance");
+
+        // Raw visibility into the funding row stays available via GET /transactions.
+        let transactions: serde_json::Value =
+            serde_json::from_str(&response_body(route(&conn, &Method::Get, "/transactions", ""))).unwrap();
+        assert_eq!(transactions.as_array().unwrap().len(), 1);
     }
 
     #[test]
@@ -1684,5 +1831,90 @@ mod tests {
         let to = balances.iter().find(|b| b["account_name"] == "Own USD").unwrap();
         assert_eq!(to["balance"], 5.0);
         assert_eq!(to["currency"], "USD");
+    }
+
+    #[test]
+    fn sentinel_envelope_account_is_seeded_at_migration() {
+        let conn = setup();
+        let (name, r#type, currency_id): (String, String, Option<i64>) = conn
+            .query_row("SELECT name, type, currency_id FROM accounts WHERE id = 0", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(name, "Envelope");
+        assert_eq!(r#type, "external");
+        assert_eq!(currency_id, None);
+    }
+
+    #[test]
+    fn create_list_and_delete_envelope() {
+        let conn = setup();
+        let response = route(&conn, &Method::Post, "/envelopes", r#"{"name": "Groceries"}"#);
+        assert_eq!(response.status_code().0, 201);
+
+        let response = route(&conn, &Method::Get, "/envelopes", "");
+        assert_eq!(response.status_code().0, 200);
+
+        let response = route(&conn, &Method::Delete, "/envelopes/1", "");
+        assert_eq!(response.status_code().0, 204);
+
+        let response = route(&conn, &Method::Delete, "/envelopes/1", "");
+        assert_eq!(response.status_code().0, 404);
+    }
+
+    #[test]
+    fn deleting_referenced_envelope_is_400() {
+        let conn = test_db();
+        conn.execute("INSERT INTO envelopes (id, name) VALUES (1, 'Groceries')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id, envelope_id) \
+             VALUES ('fund', 'Fund', '2024-01-01T00:00:00Z', -2000, 1, 0, 1)",
+            [],
+        )
+        .unwrap();
+
+        let response = route(&conn, &Method::Delete, "/envelopes/1", "");
+        assert_eq!(response.status_code().0, 400);
+    }
+
+    #[test]
+    fn funding_via_post_transactions_sets_envelope_id_and_is_funding() {
+        let conn = test_db();
+        conn.execute("INSERT INTO envelopes (id, name) VALUES (1, 'Groceries')", [])
+            .unwrap();
+        let body = r#"{"id": "fund", "description": "Fund groceries", "date": "2024-01-01T12:00:00Z", "amount": -20.00, "account_id": 1, "opposing_account_id": 0, "envelope_id": 1}"#;
+        let response = route(&conn, &Method::Post, "/transactions", body);
+        assert_eq!(response.status_code().0, 201);
+        let body = response_body(response);
+        assert!(body.contains(r#""envelope_id":1"#), "expected envelope_id in {body}");
+
+        let is_funding: bool = conn
+            .query_row("SELECT is_funding FROM transactions WHERE id = 'fund'", [], |r| r.get(0))
+            .unwrap();
+        assert!(is_funding);
+    }
+
+    #[test]
+    fn envelope_id_also_legal_on_a_transfer_between_own_accounts() {
+        let conn = test_db();
+        conn.execute("INSERT INTO envelopes (id, name) VALUES (1, 'Groceries')", [])
+            .unwrap();
+        let body = r#"{"id": "t1", "description": "Move reservation", "date": "2024-01-01T12:00:00Z", "amount": -5.00, "account_id": 1, "opposing_account_id": 2, "envelope_id": 1}"#;
+        let response = route(&conn, &Method::Post, "/transactions", body);
+        assert_eq!(response.status_code().0, 201);
+    }
+
+    #[test]
+    fn patch_rejects_envelope_id_as_unknown_field() {
+        let conn = test_db();
+        conn.execute(
+            "INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id) VALUES ('t1', 'Old', '2024-01-01T00:00:00Z', -100, 1, 4)",
+            [],
+        )
+        .unwrap();
+
+        let response = route(&conn, &Method::Patch, "/transactions/t1", r#"{"envelope_id": 1}"#);
+        assert_eq!(response.status_code().0, 400);
     }
 }
