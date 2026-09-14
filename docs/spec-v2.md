@@ -1,6 +1,6 @@
 # Pennywise v2 spec
 
-v2 makes three additions on top of [v1](spec-v1.md) — `GET /balances`, piggy banks, and tags — and one removal: `batch_id`. v1 is frozen — it stays as the historical record of what shipped first; v2 is no longer purely additive. See `CONTEXT.md` for the vocabulary this spec uses.
+v2 makes three additions on top of [v1](spec-v1.md) — `GET /balances`, envelopes, and tags — and one removal: `batch_id`. v1 is frozen — it stays as the historical record of what shipped first; v2 is no longer purely additive. See `CONTEXT.md` for the vocabulary this spec uses.
 
 > **Draft.** Sections land one at a time and get reconciled into a single document (naming, ordering, updated non-goals) once all four are written.
 
@@ -41,6 +41,64 @@ An own-to-external Transaction contributes only through the first case: the Exte
 Sum in **minor units** (`INTEGER`) and convert to major units only when serializing the response, reusing the same per-row conversion `GET /postings` applies. Summing the major-unit floats instead would reintroduce exactly the drift the `INTEGER amount` column exists to prevent, and a balance is the number most likely to be trusted down to the last unit.
 
 This is the only aggregation endpoint in v2. v1 ruled out "reports or aggregation of any kind"; v2 narrows that to permit own-account balances and nothing else — net worth, category summaries, and per-period totals stay out.
+
+## Envelopes
+
+An **Envelope** is a named, virtual reservation of money already sitting in one or more Own Accounts — never a sub-account, never a place money physically moves to. Funding one is an ordinary Transaction against a reserved sentinel Account (id `0`). Full mechanism and alternatives considered: [ADR 0004](adr/0004-envelope-funding-via-sentinel-account.md); delete-behavior rationale: [ADR 0005](adr/0005-restrict-not-set-null-for-envelope-and-category.md). Both are pinned as runnable assertions in [`0004-envelope-funding-via-sentinel-account.verify.sh`](adr/0004-envelope-funding-via-sentinel-account.verify.sh).
+
+### Schema
+
+```sql
+CREATE TABLE envelopes (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);   -- mirrors categories exactly
+
+ALTER TABLE transactions ADD COLUMN envelope_id INTEGER REFERENCES envelopes(id);          -- see Cross-table validation below for ON DELETE
+ALTER TABLE transactions ADD COLUMN is_funding GENERATED ALWAYS AS (opposing_account_id = 0) VIRTUAL;
+
+CREATE VIEW ledger AS SELECT * FROM postings WHERE NOT is_funding;   -- replaces GET /postings
+
+CREATE VIEW envelope_balances AS
+SELECT account_id, envelope_id,
+       SUM(CASE WHEN is_funding THEN -amount ELSE amount END) AS balance
+FROM postings
+WHERE envelope_id IS NOT NULL AND account_id IN (SELECT id FROM accounts WHERE type = 'own')
+GROUP BY account_id, envelope_id;
+
+CREATE VIEW account_headroom AS
+SELECT account_id, bal, still_reserved, bal - still_reserved AS headroom FROM (
+  SELECT a.id AS account_id,
+    COALESCE((SELECT SUM(amount) FROM ledger l WHERE l.account_id = a.id), 0) AS bal,
+    COALESCE((SELECT SUM(MAX(e.balance, 0)) FROM envelope_balances e WHERE e.account_id = a.id), 0) AS still_reserved
+  FROM accounts a WHERE a.type = 'own');
+```
+
+- **The sentinel Account (id `0`, name "Envelope") is seeded once at migration time**, before any user-created Account can claim that id. It is an ordinary External Account, visible via `GET /accounts` like any other — no special-casing beyond the reserved id.
+- **`is_funding` is a generated column** (`opposing_account_id = 0`) — never a value the API sets or accepts, always derived.
+- **`envelope_id` is legal on any Transaction, not just funding rows** — including a Transfer between two Own Accounts, which lets a reservation follow real money from the Account it was funded in to the Account it's actually spent from (verified end-to-end with a credit-card scenario in the harness).
+- **An Envelope's balance is per `(account_id, envelope_id)`, never summed across Accounts or Currencies** — `envelope_balances` groups by both, so funding the same Envelope from a EUR, USD, and THB Account is legal; a client wanting a combined total sums the per-Account rows itself, consistent with this API's no-server-side-aggregation stance.
+- **Overspending an Envelope is legal** — nothing enforces non-negative balances. An overspent Envelope reports a negative `balance` in `envelope_balances`, but contributes `0` (never negative) to `account_headroom.still_reserved`: an Envelope can't reserve money it doesn't have, and the overspend already shows up as reduced real balance via `GET /ledger`.
+- **`account_headroom.headroom` (`bal - still_reserved`) is a signal, not an enforced limit** — funding an Envelope from an Account that doesn't have the money to spare is legal; headroom just goes negative.
+- Neither `envelope_balances` nor `account_headroom` is exposed via any endpoint in this spec — `GET /balances` remains "the only aggregation endpoint in v2" (above). They exist at the schema level to pin and verify the funding mechanism; a client wanting an Envelope's standing today computes it from `GET /ledger`/`GET /transactions` itself, same as any other derived number in this API.
+
+### Cross-table validation
+
+Added to the shared validation function (`docs/spec-v1.md`'s "Cross-table validation" — same function, no new one):
+
+3. `envelope_id`, if present, must reference an existing Envelope — already enforced natively by the `REFERENCES` clause plus `PRAGMA foreign_keys = ON`, so no additional application-level check is needed beyond what v1's rule 1 already establishes for the pattern.
+
+**Breaking change carried over from v1: `category_id`'s `ON DELETE SET NULL` is reversed to `RESTRICT`.** Neither `category_id` nor `envelope_id` carries an explicit `ON DELETE` clause, so both fall back to SQLite's default (`NO ACTION`, enforced immediately) — the same behavior `accounts` already relies on. Reasoning: an Envelope's balance is a real computed financial signal (`account_headroom` depends on it); silently detaching a Transaction from a deleted Envelope would drift a headroom number with no Transaction to justify the change, the same integrity problem `category_id`'s original `SET NULL` was safe from only because Category is purely descriptive. Full rationale: ADR 0005. Concretely, this means `DELETE /categories/{id}` — an already-shipped, otherwise-unchanged v1 endpoint — now returns `400` (FK violation, per the existing "Cross-table validation" status-code rule) instead of always succeeding with `204`, whenever the Category is still referenced by any Transaction.
+
+### API
+
+- **`POST /envelopes`, `GET /envelopes`, `DELETE /envelopes/{id}`** — CRUD mirrors `categories` exactly: `POST` takes `{"name": "..."}` and returns `201` with `{"id", "name"}` (`400`/`409` on validation failure/duplicate name, same as `POST /categories`); `GET` lists all; `DELETE` returns `204`, or `400` if any Transaction still references the Envelope (the `RESTRICT` above), or `404` for an unknown id.
+- **No dedicated funding endpoint.** Funding an Envelope is a plain `POST /transactions` (or a row inside `POST /transactions/batch`) with `opposing_account_id: 0` and `envelope_id` set — `TransactionCreate` gains an optional, nullable `envelope_id` field alongside the existing `category_id`. (ponytail: this API already exposes Transfers the same raw way; a dedicated fund endpoint would be the only special-cased write path in the API.)
+- Like `amount`, `date`, and the account ids, `envelope_id` is not on `PATCH /transactions/{id}`'s allowed-fields list — naming it in a PATCH body is a `400`, the same immutable-field rule already applied to every field not explicitly listed as patchable.
+- **`GET /postings` is renamed to `GET /ledger`** — same shape and ordering, but excludes funding rows (`is_funding`). Raw visibility into funding Transactions (e.g. for an audit trail) isn't lost: `GET /transactions` already lists every row verbatim, funding included.
+
+### Implementation notes
+
+- **Migration ordering**: create `envelopes`, add `transactions.envelope_id`/`is_funding`, seed the sentinel Account (id `0`) and only then create the `ledger`/`envelope_balances`/`account_headroom` views (a view referencing a not-yet-existing column fails to create) — all as part of the same schema-version bump the other v2 changes ship under.
+- **SQLite version**: generated columns (`GENERATED ALWAYS AS ... VIRTUAL`) need SQLite ≥ 3.31 — comfortably covered by the same bundled `rusqlite` version already relied on for the `batch_id` column drop (≥ 3.35, see "Removed" below).
+- **`postings` as a SQL view is a modeling convenience for the schema/harness above**, not a commitment to a literal SQL object: v1 computes postings in application code (`postings_from_row`/`list_postings` in `src/main.rs`), not via a SQL view, and the shipped implementation may keep doing so — applying the `is_funding` exclusion and the `envelope_balances`/`account_headroom` aggregation in Rust instead. This spec fixes the resulting behavior, not the SQL objects that produce it.
 
 ## Removed
 
