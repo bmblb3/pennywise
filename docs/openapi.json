@@ -817,7 +817,8 @@
           "account",
           "opposing_account",
           "type",
-          "category"
+          "category",
+          "envelope"
         ],
         "properties": {
           "description": {
@@ -853,6 +854,11 @@
           "category": {
             "type": "string",
             "nullable": true
+          },
+          "envelope": {
+            "type": "string",
+            "nullable": true,
+            "description": "Set when the underlying transaction carries an envelope_id. Funding rows never reach the ledger (excluded as is_funding), so this only ever reflects a spend/transfer leg tagged against an Envelope, not an Envelope's balance.\n"
           }
         }
       },

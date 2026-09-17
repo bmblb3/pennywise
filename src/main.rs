@@ -756,16 +756,18 @@ struct LedgerResponse {
     opposing_account: String,
     r#type: &'static str,
     category: Option<String>,
+    envelope: Option<String>,
 }
 
 const LEDGER_SELECT: &str = "SELECT t.description, t.date, t.amount, t.opposing_amount, \
     a.name, ac.code, ac.minor_unit, \
     oa.name, oa.type, oc.code, oc.minor_unit, \
-    cat.name \
+    cat.name, env.name \
     FROM transactions t \
     JOIN accounts a ON t.account_id = a.id JOIN currencies ac ON a.currency_id = ac.id \
     JOIN accounts oa ON t.opposing_account_id = oa.id LEFT JOIN currencies oc ON oa.currency_id = oc.id \
     LEFT JOIN categories cat ON t.category_id = cat.id \
+    LEFT JOIN envelopes env ON t.envelope_id = env.id \
     WHERE NOT t.is_funding";
 
 /// Maps one joined `LEDGER_SELECT` row to 1 or 2 `LedgerResponse`s: always
@@ -785,6 +787,7 @@ fn ledger_from_row(row: &rusqlite::Row) -> rusqlite::Result<Vec<LedgerResponse>>
     let opposing_currency_code: Option<String> = row.get(9)?;
     let opposing_minor_unit: Option<i64> = row.get(10)?;
     let category_name: Option<String> = row.get(11)?;
+    let envelope_name: Option<String> = row.get(12)?;
 
     let major_amount = minor_to_major(amount, minor_unit);
     let primary_type = if opposing_type == "own" {
@@ -803,6 +806,7 @@ fn ledger_from_row(row: &rusqlite::Row) -> rusqlite::Result<Vec<LedgerResponse>>
         opposing_account: opposing_account_name.clone(),
         r#type: primary_type,
         category: category_name.clone(),
+        envelope: envelope_name.clone(),
     }];
 
     if opposing_type == "own" {
@@ -818,6 +822,7 @@ fn ledger_from_row(row: &rusqlite::Row) -> rusqlite::Result<Vec<LedgerResponse>>
             opposing_account: account_name,
             r#type: "Transfer",
             category: category_name,
+            envelope: envelope_name,
         });
     }
 
@@ -1771,6 +1776,40 @@ mod tests {
         let transactions: serde_json::Value =
             serde_json::from_str(&response_body(route(&conn, &Method::Get, "/transactions", ""))).unwrap();
         assert_eq!(transactions.as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ledger_row_carries_envelope_name_for_a_non_funding_spend() {
+        let conn = test_db();
+        conn.execute("INSERT INTO envelopes (id, name) VALUES (1, 'Groceries')", [])
+            .unwrap();
+        // A real spend tagged against the envelope (not funding, so it appears in the ledger).
+        conn.execute(
+            "INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id, envelope_id) \
+             VALUES ('spend', 'Bought groceries', '2024-01-01T00:00:00Z', -500, 1, 4, 1)",
+            [],
+        )
+        .unwrap();
+
+        let ledger: serde_json::Value =
+            serde_json::from_str(&response_body(route(&conn, &Method::Get, "/ledger", ""))).unwrap();
+        let rows = ledger.as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["envelope"], "Groceries");
+    }
+
+    #[test]
+    fn ledger_row_envelope_is_null_when_not_tagged() {
+        let conn = test_db();
+        conn.execute(
+            "INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id) \
+             VALUES ('t1', 'Untagged', '2024-01-01T00:00:00Z', -500, 1, 4)",
+            [],
+        )
+        .unwrap();
+        let ledger: serde_json::Value =
+            serde_json::from_str(&response_body(route(&conn, &Method::Get, "/ledger", ""))).unwrap();
+        assert_eq!(ledger.as_array().unwrap()[0]["envelope"], serde_json::Value::Null);
     }
 
     #[test]
