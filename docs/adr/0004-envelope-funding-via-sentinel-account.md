@@ -1,5 +1,7 @@
 # Envelope funding is a Transaction against a sentinel Account
 
+> **Note:** the "no dedicated funding endpoint" consequence below was reversed by [ADR 0006](0006-dedicated-fundings-endpoint.md), which adds `POST`/`GET /fundings` as a thin wrapper over the same mechanism. The model described here — funding as an ordinary Transaction against the sentinel Account — is unchanged.
+
 v2 needed a way to earmark money already sitting in an Own Account for a purpose ("Groceries", "Vacation") without physically moving it anywhere — the earmark is virtual, the money doesn't leave. The chosen mechanism: a reserved External Account with a fixed id (`0`, name "Envelope"), seeded once at migration time before any user-created Account can claim that id. "Funding" an Envelope is then an ordinary Transaction — `account_id` = the real Own Account, `opposing_account_id` = `0`, `envelope_id` = the Envelope being funded. A generated column, `is_funding` (`opposing_account_id = 0`), flags these rows.
 
 This was chosen over two alternatives considered and rejected:

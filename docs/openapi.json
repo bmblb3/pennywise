@@ -580,6 +580,58 @@
         }
       }
     },
+    "/fundings": {
+      "post": {
+        "summary": "Fund an envelope",
+        "description": "A thin wrapper around POST /transactions (ADR 0006): sets opposing_account_id to the sentinel Envelope Account (id 0), generates the transaction id server-side, and negates amount into the outflow POST /transactions expects. Unlike POST /transactions, id is not caller-supplied, so this path has no dedup guarantee — calling it twice creates two separate fundings. envelope_id is required (nullable on TransactionCreate, required here). Runs the same cross-table validation as POST /transactions.\n",
+        "operationId": "createFunding",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FundingCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Transaction"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          }
+        }
+      },
+      "get": {
+        "summary": "List all fundings",
+        "description": "GET /ledger's mirror image: selects is_funding rows instead of excluding them, with the same denormalized names/currency. amount is reported as a positive magnitude (the amount reserved), matching what POST /fundings accepts — opposite of GET /ledger's account-signed convention, since every row here is by construction an outflow into the sentinel account. Ordered by date DESC, id.\n",
+        "operationId": "listFundings",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/FundingRow"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/balances": {
       "get": {
         "summary": "List the current balance of every own account",
@@ -859,6 +911,74 @@
             "type": "string",
             "nullable": true,
             "description": "Set when the underlying transaction carries an envelope_id. Funding rows never reach the ledger (excluded as is_funding), so this only ever reflects a spend/transfer leg tagged against an Envelope, not an Envelope's balance.\n"
+          }
+        }
+      },
+      "FundingCreate": {
+        "type": "object",
+        "required": [
+          "account_id",
+          "envelope_id",
+          "amount",
+          "date",
+          "description"
+        ],
+        "properties": {
+          "account_id": {
+            "type": "integer",
+            "description": "Must reference an account of type 'own'"
+          },
+          "envelope_id": {
+            "type": "integer",
+            "description": "Required (nullable on TransactionCreate, required here — this endpoint's whole purpose is funding one)"
+          },
+          "amount": {
+            "type": "number",
+            "description": "Unsigned magnitude in major units, must be positive — the amount to reserve. Stored as amount: -amount on the underlying Transaction (an outflow from account_id). Rejected with 400 if it has more decimal places than account_id's currency's minor_unit allows.\n"
+          },
+          "date": {
+            "type": "string",
+            "format": "date-time",
+            "description": "RFC3339"
+          },
+          "description": {
+            "type": "string"
+          }
+        }
+      },
+      "FundingRow": {
+        "type": "object",
+        "required": [
+          "description",
+          "date",
+          "amount",
+          "currency",
+          "account",
+          "envelope"
+        ],
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "date": {
+            "type": "string",
+            "format": "date-time",
+            "description": "RFC3339"
+          },
+          "amount": {
+            "type": "number",
+            "description": "Major units, positive — the amount reserved. Opposite sign convention from LedgerRow.amount: every row here is by construction an outflow into the sentinel account, so there's no sign ambiguity to preserve.\n"
+          },
+          "currency": {
+            "type": "string"
+          },
+          "account": {
+            "type": "string"
+          },
+          "envelope": {
+            "type": "string",
+            "nullable": true,
+            "description": "Null only for a funding row created via raw POST /transactions with envelope_id omitted; POST /fundings always sets it.\n"
           }
         }
       },

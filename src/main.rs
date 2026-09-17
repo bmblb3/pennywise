@@ -841,6 +841,84 @@ fn list_ledger(conn: &Connection) -> Response<Cursor<Vec<u8>>> {
     json_response(200, serde_json::to_string(&rows).unwrap())
 }
 
+// --- Fundings handlers --------------------------------------------------
+//
+// A friendlier read/write pair over the same funding transactions ADR 0004
+// models as `opposing_account_id: 0`: `POST /fundings` is a thin wrapper
+// around `insert_transaction` (server picks the id, caller gives an unsigned
+// "amount to reserve" instead of a signed outflow), and `GET /fundings` is
+// `GET /ledger`'s mirror image (`is_funding` rows only, denormalized names).
+
+#[derive(Deserialize)]
+struct CreateFundingRequest {
+    account_id: i64,
+    envelope_id: i64,
+    amount: f64,
+    date: String,
+    description: String,
+}
+
+fn create_funding(conn: &Connection, body: &str) -> Response<Cursor<Vec<u8>>> {
+    let Ok(req) = serde_json::from_str::<CreateFundingRequest>(body) else {
+        return error_response(400, "expected {account_id, envelope_id, amount, date, description}");
+    };
+    if req.amount <= 0.0 {
+        return error_response(400, "amount must be positive (the magnitude to reserve)");
+    }
+
+    let txn_req = CreateTransactionRequest {
+        id: format!("fund-{}", OffsetDateTime::now_utc().unix_timestamp_nanos()),
+        description: req.description,
+        date: req.date,
+        amount: -req.amount,
+        opposing_amount: None,
+        account_id: req.account_id,
+        opposing_account_id: 0,
+        category_id: None,
+        envelope_id: Some(req.envelope_id),
+    };
+    match insert_transaction(conn, txn_req) {
+        Ok(txn) => json_response(201, serde_json::to_string(&txn).unwrap()),
+        Err(resp) => resp,
+    }
+}
+
+#[derive(Serialize)]
+struct FundingResponse {
+    description: String,
+    date: String,
+    amount: f64,
+    currency: String,
+    account: String,
+    envelope: Option<String>,
+}
+
+const FUNDING_SELECT: &str = "SELECT t.description, t.date, t.amount, \
+    a.name, ac.code, ac.minor_unit, env.name \
+    FROM transactions t \
+    JOIN accounts a ON t.account_id = a.id JOIN currencies ac ON a.currency_id = ac.id \
+    LEFT JOIN envelopes env ON t.envelope_id = env.id \
+    WHERE t.is_funding";
+
+/// `amount` is stored as the (negative) outflow from `account_id`; negated
+/// here back into the positive "amount reserved" `POST /fundings` accepts.
+fn funding_json(row: &rusqlite::Row) -> rusqlite::Result<FundingResponse> {
+    let amount: i64 = row.get(2)?;
+    let minor_unit: i64 = row.get(5)?;
+    Ok(FundingResponse {
+        description: row.get(0)?,
+        date: row.get(1)?,
+        amount: -minor_to_major(amount, minor_unit),
+        currency: row.get(4)?,
+        account: row.get(3)?,
+        envelope: row.get(6)?,
+    })
+}
+
+fn list_fundings(conn: &Connection) -> Response<Cursor<Vec<u8>>> {
+    list(conn, &format!("{FUNDING_SELECT} ORDER BY t.date DESC, t.id"), funding_json)
+}
+
 // --- Balances ---------------------------------------------------------------
 //
 // One row per own account, summing the same contributions GET /ledger
@@ -939,6 +1017,9 @@ fn route(conn: &Connection, method: &Method, path: &str, body: &str) -> Response
         (Method::Delete, ["transactions", id]) => delete_transaction(conn, id),
 
         (Method::Get, ["ledger"]) => list_ledger(conn),
+
+        (Method::Post, ["fundings"]) => create_funding(conn, body),
+        (Method::Get, ["fundings"]) => list_fundings(conn),
 
         (Method::Get, ["balances"]) => list_balances(conn),
 
@@ -1776,6 +1857,63 @@ mod tests {
         let transactions: serde_json::Value =
             serde_json::from_str(&response_body(route(&conn, &Method::Get, "/transactions", ""))).unwrap();
         assert_eq!(transactions.as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn post_fundings_creates_a_negative_sentinel_transaction() {
+        let conn = test_db();
+        conn.execute("INSERT INTO envelopes (id, name) VALUES (1, 'Groceries')", [])
+            .unwrap();
+
+        let body = r#"{"account_id": 1, "envelope_id": 1, "amount": 20.00, "date": "2024-01-01T00:00:00Z", "description": "Fund groceries"}"#;
+        let response = route(&conn, &Method::Post, "/fundings", body);
+        assert_eq!(response.status_code().0, 201);
+        let txn: serde_json::Value = serde_json::from_str(&response_body(response)).unwrap();
+        assert_eq!(txn["amount"], -20.0, "the underlying transaction is signed as an outflow from account_id");
+        assert_eq!(txn["opposing_account_id"], 0);
+        assert_eq!(txn["envelope_id"], 1);
+
+        // Doesn't appear in GET /ledger (funding rows are excluded there).
+        let ledger: serde_json::Value =
+            serde_json::from_str(&response_body(route(&conn, &Method::Get, "/ledger", ""))).unwrap();
+        assert_eq!(ledger.as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn get_fundings_lists_denormalized_positive_amounts() {
+        let conn = test_db();
+        conn.execute("INSERT INTO envelopes (id, name) VALUES (1, 'Groceries')", [])
+            .unwrap();
+        let body = r#"{"account_id": 1, "envelope_id": 1, "amount": 20.00, "date": "2024-01-01T00:00:00Z", "description": "Fund groceries"}"#;
+        route(&conn, &Method::Post, "/fundings", body);
+
+        let response = route(&conn, &Method::Get, "/fundings", "");
+        assert_eq!(response.status_code().0, 200);
+        let rows: serde_json::Value = serde_json::from_str(&response_body(response)).unwrap();
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["amount"], 20.0, "GET /fundings mirrors POST /fundings' positive amount-to-reserve");
+        assert_eq!(rows[0]["account"], "Own SEK A");
+        assert_eq!(rows[0]["envelope"], "Groceries");
+        assert_eq!(rows[0]["currency"], "SEK");
+    }
+
+    #[test]
+    fn post_fundings_rejects_non_positive_amount() {
+        let conn = test_db();
+        conn.execute("INSERT INTO envelopes (id, name) VALUES (1, 'Groceries')", [])
+            .unwrap();
+        let body = r#"{"account_id": 1, "envelope_id": 1, "amount": 0, "date": "2024-01-01T00:00:00Z", "description": "x"}"#;
+        let response = route(&conn, &Method::Post, "/fundings", body);
+        assert_eq!(response.status_code().0, 400);
+    }
+
+    #[test]
+    fn post_fundings_unknown_envelope_is_400() {
+        let conn = test_db();
+        let body = r#"{"account_id": 1, "envelope_id": 999, "amount": 20.00, "date": "2024-01-01T00:00:00Z", "description": "x"}"#;
+        let response = route(&conn, &Method::Post, "/fundings", body);
+        assert_eq!(response.status_code().0, 400);
     }
 
     #[test]
