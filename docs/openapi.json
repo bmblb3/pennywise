@@ -653,6 +653,50 @@
           }
         }
       }
+    },
+    "/envelope_balances": {
+      "get": {
+        "summary": "List every envelope's balance per account",
+        "description": "One row per (account, envelope) with any tagged transaction (ADR 0007). balance = funded minus spent, computed the same way the schema-level envelope_balances view defines it (ADR 0004): SUM(-amount) for funding rows plus SUM(amount) for every other tagged row. Never summed across accounts or currencies — funding the same envelope from accounts of different currencies is legal, so a client wanting a combined total sums these rows itself. Can be negative when overspent; nothing here enforces non-negative balances. Ordered by account_id, envelope_id.\n",
+        "operationId": "listEnvelopeBalances",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/EnvelopeBalance"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/account_headroom": {
+      "get": {
+        "summary": "List each own account's real balance against what's still reserved by its envelopes",
+        "description": "One row per own account, including accounts with no envelope activity (still_reserved 0). bal is the same number GET /balances reports for that account; still_reserved sums each envelope's balance on the account, floored at 0 per envelope (an overspent envelope contributes 0, never negative); headroom is bal - still_reserved. headroom is a signal, not an enforced limit — funding an envelope from an account that doesn't have the money to spare is legal, and headroom just goes negative (ADR 0004, ADR 0007). Ordered by account_id.\n",
+        "operationId": "listAccountHeadroom",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AccountHeadroom"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1003,6 +1047,64 @@
           },
           "currency": {
             "type": "string"
+          }
+        }
+      },
+      "EnvelopeBalance": {
+        "type": "object",
+        "required": [
+          "account",
+          "envelope",
+          "currency",
+          "balance"
+        ],
+        "properties": {
+          "account": {
+            "type": "string"
+          },
+          "envelope": {
+            "type": "string"
+          },
+          "currency": {
+            "type": "string"
+          },
+          "balance": {
+            "type": "number",
+            "description": "Major units. Funded minus spent; can be negative when overspent.\n"
+          }
+        }
+      },
+      "AccountHeadroom": {
+        "type": "object",
+        "required": [
+          "account_id",
+          "account_name",
+          "currency",
+          "bal",
+          "still_reserved",
+          "headroom"
+        ],
+        "properties": {
+          "account_id": {
+            "type": "integer"
+          },
+          "account_name": {
+            "type": "string"
+          },
+          "currency": {
+            "type": "string"
+          },
+          "bal": {
+            "type": "number",
+            "description": "Major units. The same number GET /balances reports for this account."
+          },
+          "still_reserved": {
+            "type": "number",
+            "description": "Major units. Sum of this account's envelope balances, each floored at 0.\n"
+          },
+          "headroom": {
+            "type": "number",
+            "description": "Major units. bal - still_reserved. A signal, not an enforced limit; can be negative.\n"
           }
         }
       }

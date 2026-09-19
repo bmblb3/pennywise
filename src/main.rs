@@ -982,6 +982,99 @@ fn list_balances(conn: &Connection) -> Response<Cursor<Vec<u8>>> {
     )
 }
 
+// --- Envelope balances & account headroom -----------------------------------
+//
+// `envelope_balances`/`account_headroom` from spec-v2.md, computed here in
+// application code rather than as literal SQL views (same choice already
+// made for `ledger`/`balances` above — the spec fixes the resulting
+// behavior, not the SQL objects that produce it).
+
+#[derive(Serialize)]
+struct EnvelopeBalanceResponse {
+    account: String,
+    envelope: String,
+    currency: String,
+    balance: f64,
+}
+
+fn list_envelope_balances(conn: &Connection) -> Response<Cursor<Vec<u8>>> {
+    list(
+        conn,
+        "SELECT a.name, env.name, ac.code, ac.minor_unit, \
+             SUM(CASE WHEN t.is_funding THEN -t.amount ELSE t.amount END) \
+         FROM transactions t \
+         JOIN accounts a ON t.account_id = a.id JOIN currencies ac ON a.currency_id = ac.id \
+         JOIN envelopes env ON t.envelope_id = env.id \
+         WHERE t.envelope_id IS NOT NULL AND a.type = 'own' \
+         GROUP BY t.account_id, t.envelope_id \
+         ORDER BY t.account_id, t.envelope_id",
+        |row| {
+            let minor_unit: i64 = row.get(3)?;
+            let balance: i64 = row.get(4)?;
+            Ok(EnvelopeBalanceResponse {
+                account: row.get(0)?,
+                envelope: row.get(1)?,
+                currency: row.get(2)?,
+                balance: minor_to_major(balance, minor_unit),
+            })
+        },
+    )
+}
+
+/// Per own account, the sum of each of its Envelopes' balance floored at `0`
+/// — an overspent Envelope can't reserve money it doesn't have (spec-v2.md).
+fn still_reserved_minor_by_account(conn: &Connection) -> HashMap<i64, i64> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT account_id, SUM(CASE WHEN is_funding THEN -amount ELSE amount END) \
+             FROM transactions WHERE envelope_id IS NOT NULL GROUP BY account_id, envelope_id",
+        )
+        .expect("prepare envelope balances by account");
+    let mut reserved: HashMap<i64, i64> = HashMap::new();
+    let rows = stmt
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+        .expect("query envelope balances by account");
+    for row in rows {
+        let (account_id, balance) = row.expect("read envelope balance row");
+        *reserved.entry(account_id).or_insert(0) += balance.max(0);
+    }
+    reserved
+}
+
+#[derive(Serialize)]
+struct AccountHeadroomResponse {
+    account_id: i64,
+    account_name: String,
+    currency: String,
+    bal: f64,
+    still_reserved: f64,
+    headroom: f64,
+}
+
+fn list_account_headroom(conn: &Connection) -> Response<Cursor<Vec<u8>>> {
+    let minor_balances = minor_balances_by_account(conn);
+    let still_reserved = still_reserved_minor_by_account(conn);
+    list(
+        conn,
+        "SELECT a.id, a.name, c.code, c.minor_unit FROM accounts a \
+         JOIN currencies c ON a.currency_id = c.id WHERE a.type = 'own' ORDER BY a.id",
+        |row| {
+            let account_id: i64 = row.get(0)?;
+            let minor_unit: i64 = row.get(3)?;
+            let bal_minor = minor_balances.get(&account_id).copied().unwrap_or(0);
+            let reserved_minor = still_reserved.get(&account_id).copied().unwrap_or(0);
+            Ok(AccountHeadroomResponse {
+                account_id,
+                account_name: row.get(1)?,
+                currency: row.get(2)?,
+                bal: minor_to_major(bal_minor, minor_unit),
+                still_reserved: minor_to_major(reserved_minor, minor_unit),
+                headroom: minor_to_major(bal_minor - reserved_minor, minor_unit),
+            })
+        },
+    )
+}
+
 // --- Routing ----------------------------------------------------------------
 //
 // Dispatch skeleton: matches method + path against the known resource
@@ -1022,6 +1115,9 @@ fn route(conn: &Connection, method: &Method, path: &str, body: &str) -> Response
         (Method::Get, ["fundings"]) => list_fundings(conn),
 
         (Method::Get, ["balances"]) => list_balances(conn),
+
+        (Method::Get, ["envelope_balances"]) => list_envelope_balances(conn),
+        (Method::Get, ["account_headroom"]) => list_account_headroom(conn),
 
         (Method::Get, ["openapi.json"]) => {
             json_response(200, include_str!("../docs/openapi.json").to_string())
@@ -2114,6 +2210,172 @@ mod tests {
         let to = balances.iter().find(|b| b["account_name"] == "Own USD").unwrap();
         assert_eq!(to["balance"], 5.0);
         assert_eq!(to["currency"], "USD");
+    }
+
+    #[test]
+    fn envelope_balances_sums_funding_and_spend_for_one_account_envelope() {
+        let conn = test_db();
+        conn.execute("INSERT INTO envelopes (id, name) VALUES (1, 'Groceries')", []).unwrap();
+        route(
+            &conn,
+            &Method::Post,
+            "/fundings",
+            r#"{"account_id": 1, "envelope_id": 1, "amount": 20.00, "date": "2024-01-01T00:00:00Z", "description": "Fund groceries"}"#,
+        );
+        conn.execute(
+            "INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id, envelope_id) \
+             VALUES ('spend', 'Bought groceries', '2024-01-02T00:00:00Z', -500, 1, 4, 1)",
+            [],
+        )
+        .unwrap();
+
+        let response = route(&conn, &Method::Get, "/envelope_balances", "");
+        assert_eq!(response.status_code().0, 200);
+        let rows: serde_json::Value = serde_json::from_str(&response_body(response)).unwrap();
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["account"], "Own SEK A");
+        assert_eq!(rows[0]["envelope"], "Groceries");
+        assert_eq!(rows[0]["currency"], "SEK");
+        assert_eq!(rows[0]["balance"], 15.0, "20.00 funded minus 5.00 spent");
+    }
+
+    #[test]
+    fn envelope_balances_are_scoped_per_account_never_summed() {
+        let conn = test_db();
+        conn.execute("INSERT INTO envelopes (id, name) VALUES (1, 'Vacation')", []).unwrap();
+        route(
+            &conn,
+            &Method::Post,
+            "/fundings",
+            r#"{"account_id": 1, "envelope_id": 1, "amount": 20.00, "date": "2024-01-01T00:00:00Z", "description": "SEK leg"}"#,
+        );
+        route(
+            &conn,
+            &Method::Post,
+            "/fundings",
+            r#"{"account_id": 3, "envelope_id": 1, "amount": 10.00, "date": "2024-01-01T00:00:00Z", "description": "USD leg"}"#,
+        );
+
+        let response = route(&conn, &Method::Get, "/envelope_balances", "");
+        let rows: serde_json::Value = serde_json::from_str(&response_body(response)).unwrap();
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), 2, "one row per (account, envelope), never combined across accounts/currencies");
+
+        let sek = rows.iter().find(|r| r["account"] == "Own SEK A").unwrap();
+        assert_eq!(sek["balance"], 20.0);
+        assert_eq!(sek["currency"], "SEK");
+
+        let usd = rows.iter().find(|r| r["account"] == "Own USD").unwrap();
+        assert_eq!(usd["balance"], 10.0);
+        assert_eq!(usd["currency"], "USD");
+    }
+
+    #[test]
+    fn envelope_balances_excludes_transactions_without_an_envelope() {
+        let conn = test_db();
+        route(&conn, &Method::Post, "/transactions", TXN_BODY); // no envelope_id
+        let response = route(&conn, &Method::Get, "/envelope_balances", "");
+        let rows: serde_json::Value = serde_json::from_str(&response_body(response)).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn envelope_balances_can_be_negative_when_overspent() {
+        let conn = test_db();
+        conn.execute("INSERT INTO envelopes (id, name) VALUES (1, 'Groceries')", []).unwrap();
+        route(
+            &conn,
+            &Method::Post,
+            "/fundings",
+            r#"{"account_id": 1, "envelope_id": 1, "amount": 5.00, "date": "2024-01-01T00:00:00Z", "description": "Fund groceries"}"#,
+        );
+        conn.execute(
+            "INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id, envelope_id) \
+             VALUES ('spend', 'Overspent', '2024-01-02T00:00:00Z', -2000, 1, 4, 1)",
+            [],
+        )
+        .unwrap();
+
+        let response = route(&conn, &Method::Get, "/envelope_balances", "");
+        let rows: serde_json::Value = serde_json::from_str(&response_body(response)).unwrap();
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["balance"], -15.0, "5.00 funded minus 20.00 spent, negative balances are reported as-is");
+    }
+
+    #[test]
+    fn account_headroom_defaults_to_zero_reserved_for_every_own_account() {
+        let conn = test_db();
+        let response = route(&conn, &Method::Get, "/account_headroom", "");
+        assert_eq!(response.status_code().0, 200);
+        let rows: serde_json::Value = serde_json::from_str(&response_body(response)).unwrap();
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), 3, "external account must not get a row, same as GET /balances");
+
+        let a = rows.iter().find(|r| r["account_name"] == "Own SEK A").unwrap();
+        assert_eq!(a["bal"], 0.0);
+        assert_eq!(a["still_reserved"], 0.0);
+        assert_eq!(a["headroom"], 0.0);
+        assert_eq!(a["currency"], "SEK");
+    }
+
+    #[test]
+    fn account_headroom_still_reserved_sums_only_positive_envelope_balances() {
+        let conn = test_db();
+        conn.execute("INSERT INTO envelopes (id, name) VALUES (1, 'Groceries'), (2, 'Rent')", []).unwrap();
+        // Groceries: funded 20, spent 5 -> +15. Rent: funded 5, spent 20 -> -15 (overspent).
+        route(
+            &conn,
+            &Method::Post,
+            "/fundings",
+            r#"{"account_id": 1, "envelope_id": 1, "amount": 20.00, "date": "2024-01-01T00:00:00Z", "description": "Fund groceries"}"#,
+        );
+        conn.execute(
+            "INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id, envelope_id) \
+             VALUES ('spend1', 'Groceries spend', '2024-01-02T00:00:00Z', -500, 1, 4, 1)",
+            [],
+        )
+        .unwrap();
+        route(
+            &conn,
+            &Method::Post,
+            "/fundings",
+            r#"{"account_id": 1, "envelope_id": 2, "amount": 5.00, "date": "2024-01-01T00:00:00Z", "description": "Fund rent"}"#,
+        );
+        conn.execute(
+            "INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id, envelope_id) \
+             VALUES ('spend2', 'Rent spend', '2024-01-03T00:00:00Z', -2000, 1, 4, 2)",
+            [],
+        )
+        .unwrap();
+
+        let response = route(&conn, &Method::Get, "/account_headroom", "");
+        let rows: serde_json::Value = serde_json::from_str(&response_body(response)).unwrap();
+        let a = rows.as_array().unwrap().iter().find(|r| r["account_name"] == "Own SEK A").unwrap();
+        assert_eq!(
+            a["still_reserved"], 15.0,
+            "only Groceries' +15 counts; Rent's -15 contributes 0, never negative"
+        );
+    }
+
+    #[test]
+    fn account_headroom_bal_excludes_funding_same_as_balances() {
+        let conn = test_db();
+        conn.execute("INSERT INTO envelopes (id, name) VALUES (1, 'Groceries')", []).unwrap();
+        route(
+            &conn,
+            &Method::Post,
+            "/fundings",
+            r#"{"account_id": 1, "envelope_id": 1, "amount": 20.00, "date": "2024-01-01T00:00:00Z", "description": "Fund groceries"}"#,
+        );
+
+        let headroom: serde_json::Value =
+            serde_json::from_str(&response_body(route(&conn, &Method::Get, "/account_headroom", ""))).unwrap();
+        let a = headroom.as_array().unwrap().iter().find(|r| r["account_name"] == "Own SEK A").unwrap();
+        assert_eq!(a["bal"], 0.0, "funding must not move the real balance");
+        assert_eq!(a["still_reserved"], 20.0);
+        assert_eq!(a["headroom"], -20.0, "bal - still_reserved goes negative when funded beyond what's really there");
     }
 
     #[test]
