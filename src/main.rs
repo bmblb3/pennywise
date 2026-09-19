@@ -1917,6 +1917,112 @@ mod tests {
     }
 
     #[test]
+    fn post_fundings_missing_field_is_400() {
+        let conn = test_db();
+        conn.execute("INSERT INTO envelopes (id, name) VALUES (1, 'Groceries')", [])
+            .unwrap();
+        let body = r#"{"account_id": 1, "amount": 20.00, "date": "2024-01-01T00:00:00Z", "description": "x"}"#; // envelope_id omitted
+        let response = route(&conn, &Method::Post, "/fundings", body);
+        assert_eq!(response.status_code().0, 400);
+    }
+
+    #[test]
+    fn post_fundings_unknown_account_is_400() {
+        let conn = test_db();
+        conn.execute("INSERT INTO envelopes (id, name) VALUES (1, 'Groceries')", [])
+            .unwrap();
+        let body = r#"{"account_id": 999, "envelope_id": 1, "amount": 20.00, "date": "2024-01-01T00:00:00Z", "description": "x"}"#;
+        let response = route(&conn, &Method::Post, "/fundings", body);
+        assert_eq!(response.status_code().0, 400);
+    }
+
+    #[test]
+    fn post_fundings_external_account_is_400() {
+        let conn = test_db();
+        conn.execute("INSERT INTO envelopes (id, name) VALUES (1, 'Groceries')", [])
+            .unwrap();
+        // account 4 is 'external' in test_db(); funding must come from an 'own' account.
+        let body = r#"{"account_id": 4, "envelope_id": 1, "amount": 20.00, "date": "2024-01-01T00:00:00Z", "description": "x"}"#;
+        let response = route(&conn, &Method::Post, "/fundings", body);
+        assert_eq!(response.status_code().0, 400);
+    }
+
+    #[test]
+    fn post_fundings_has_no_dedup_repeated_calls_create_separate_rows() {
+        let conn = test_db();
+        conn.execute("INSERT INTO envelopes (id, name) VALUES (1, 'Groceries')", [])
+            .unwrap();
+        let body = r#"{"account_id": 1, "envelope_id": 1, "amount": 20.00, "date": "2024-01-01T00:00:00Z", "description": "Fund groceries"}"#;
+
+        let first = route(&conn, &Method::Post, "/fundings", body);
+        assert_eq!(first.status_code().0, 201);
+        let second = route(&conn, &Method::Post, "/fundings", body);
+        assert_eq!(second.status_code().0, 201, "unlike POST /transactions, identical fundings aren't deduped");
+
+        let first_id = serde_json::from_str::<serde_json::Value>(&response_body(first)).unwrap()["id"].clone();
+        let second_id = serde_json::from_str::<serde_json::Value>(&response_body(second)).unwrap()["id"].clone();
+        assert_ne!(first_id, second_id, "each funding gets its own server-generated id");
+
+        let fundings: serde_json::Value =
+            serde_json::from_str(&response_body(route(&conn, &Method::Get, "/fundings", ""))).unwrap();
+        assert_eq!(fundings.as_array().unwrap().len(), 2, "two separate rows, not one deduped row");
+    }
+
+    #[test]
+    fn get_fundings_envelope_is_null_for_a_raw_transaction_without_one() {
+        let conn = test_db();
+        // Funding via raw POST /transactions with envelope_id omitted is legal
+        // (is_funding only depends on opposing_account_id), unlike POST /fundings
+        // which always requires one.
+        conn.execute(
+            "INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id) \
+             VALUES ('fund', 'Untagged reserve', '2024-01-01T00:00:00Z', -1000, 1, 0)",
+            [],
+        )
+        .unwrap();
+
+        let fundings: serde_json::Value =
+            serde_json::from_str(&response_body(route(&conn, &Method::Get, "/fundings", ""))).unwrap();
+        let rows = fundings.as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["envelope"], serde_json::Value::Null);
+        assert_eq!(rows[0]["amount"], 10.0);
+    }
+
+    #[test]
+    fn get_fundings_excludes_non_funding_rows_and_orders_by_date_desc() {
+        let conn = test_db();
+        conn.execute("INSERT INTO envelopes (id, name) VALUES (1, 'Groceries')", [])
+            .unwrap();
+        // A real spend tagged with the same envelope must not show up in GET /fundings.
+        conn.execute(
+            "INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id, envelope_id) \
+             VALUES ('spend', 'Bought groceries', '2024-01-05T00:00:00Z', -500, 1, 4, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id, envelope_id) \
+             VALUES ('fund-early', 'Early funding', '2024-01-01T00:00:00Z', -1000, 1, 0, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO transactions (id, description, date, amount, account_id, opposing_account_id, envelope_id) \
+             VALUES ('fund-late', 'Late funding', '2024-01-10T00:00:00Z', -2000, 1, 0, 1)",
+            [],
+        )
+        .unwrap();
+
+        let fundings: serde_json::Value =
+            serde_json::from_str(&response_body(route(&conn, &Method::Get, "/fundings", ""))).unwrap();
+        let rows = fundings.as_array().unwrap();
+        assert_eq!(rows.len(), 2, "the non-funding spend row must be excluded");
+        assert_eq!(rows[0]["description"], "Late funding", "ordered by date DESC");
+        assert_eq!(rows[1]["description"], "Early funding");
+    }
+
+    #[test]
     fn ledger_row_carries_envelope_name_for_a_non_funding_spend() {
         let conn = test_db();
         conn.execute("INSERT INTO envelopes (id, name) VALUES (1, 'Groceries')", [])
