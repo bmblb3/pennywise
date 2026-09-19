@@ -1162,9 +1162,7 @@ mod tests {
     /// Sets up an in-memory DB with two currencies (SEK id 1, USD id 2) and four
     /// accounts: 1 = own/SEK, 2 = own/SEK, 3 = own/USD, 4 = external.
     fn test_db() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
-        migrate(&conn);
+        let conn = setup();
         conn.execute_batch(
             "
             INSERT INTO currencies (id, code, minor_unit) VALUES (1, 'SEK', 2), (2, 'USD', 2);
