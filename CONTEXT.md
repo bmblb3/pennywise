@@ -51,5 +51,9 @@ The classification attached to a Transaction for the owner's own reference. Pure
 _Avoid_: tag, label, bucket, type
 
 **Envelope**:
-A named, virtual reservation of money already sitting in one or more Own Accounts — never a place money moves to. Funding an Envelope is a Transaction whose Opposing Account is the reserved sentinel External Account (id `0`, name "Envelope"); it reserves money in the Transaction's own Account without moving it, so it never appears in the Ledger. An Envelope's balance (funded minus spent) is computed per Own Account touched, never summed across Accounts — a reservation can span Accounts of different Currencies. Deleting an Envelope any Transaction still references is rejected, same as an Account.
+A named, virtual reservation of money already sitting in one or more Own Accounts — never a place money moves to. Funding an Envelope is a Transaction whose Opposing Account is the reserved sentinel External Account (id `0`, name "Envelope"); it reserves money in the Transaction's own Account without moving it, so it never appears in the Ledger. An Envelope's balance (funded minus spent) is computed per Own Account touched, never summed across Accounts — a reservation can span Accounts of different Currencies. Can be negative if overspent; nothing enforces non-negative balances. Deleting an Envelope any Transaction still references is rejected, same as an Account. Exposed via `GET /envelope_balances`; funding one is `POST /fundings`.
 _Avoid_: piggy bank, budget, pot, bucket, goal
+
+**Headroom**:
+How much of an Own Account's real balance isn't already reserved by its Envelopes: the Account's balance minus the sum of its Envelopes' balances there, each floored at `0` (an overspent Envelope can't reserve money it doesn't have). A signal, not an enforced limit — funding an Envelope from an Account that doesn't have the money to spare is legal, and headroom just goes negative. Exposed via `GET /account_headroom`.
+_Avoid_: available balance, spendable, free balance
