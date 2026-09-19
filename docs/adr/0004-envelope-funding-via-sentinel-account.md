@@ -13,7 +13,7 @@ This was chosen over two alternatives considered and rejected:
 
 Since a funding Transaction is a real row with a real `account_id`, it would otherwise distort that Account's reported balance under v2's existing `GET /balances` definition (closed in [Spec: GET /balances](https://github.com/bmblb3/pennywise/issues/24), which sums `GET /postings`). `GET /postings` is renamed to `GET /ledger`, backed by a view that excludes `is_funding` rows — real balances and statements only ever see real money movement. `CONTEXT.md`'s **Ledger** definition narrows accordingly (was "the complete record of Transactions," now "the record of real-money Transactions"). Raw visibility into funding Transactions (e.g. for an audit trail) isn't lost — `GET /transactions` already lists every row verbatim, funding included.
 
-The schema, views, and every scenario below are pinned as runnable assertions in [`0004-envelope-funding-via-sentinel-account.verify.sh`](0004-envelope-funding-via-sentinel-account.verify.sh) — a plain `sqlite3` script, no framework, run with no arguments. It exists so an eventual Rust implementation has a spec to build against and a regression net to refactor under, not because this ADR needed proving twice.
+The schema, views, and every scenario below were pinned as runnable assertions in a `sqlite3` verification script ahead of the Rust implementation, giving it a spec to build against. That script is now retired — `src/main.rs`'s test suite covers the same scenarios against the real implementation instead.
 
 ## Consequences
 

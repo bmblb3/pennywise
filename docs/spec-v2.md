@@ -44,7 +44,7 @@ This is the only endpoint aggregating real money movement in v2. v1 ruled out "r
 
 ## Envelopes
 
-An **Envelope** is a named, virtual reservation of money already sitting in one or more Own Accounts — never a sub-account, never a place money physically moves to. Funding one is an ordinary Transaction against a reserved sentinel Account (id `0`). Full mechanism and alternatives considered: [ADR 0004](adr/0004-envelope-funding-via-sentinel-account.md); delete-behavior rationale: [ADR 0005](adr/0005-restrict-not-set-null-for-envelope-and-category.md). Both are pinned as runnable assertions in [`0004-envelope-funding-via-sentinel-account.verify.sh`](adr/0004-envelope-funding-via-sentinel-account.verify.sh).
+An **Envelope** is a named, virtual reservation of money already sitting in one or more Own Accounts — never a sub-account, never a place money physically moves to. Funding one is an ordinary Transaction against a reserved sentinel Account (id `0`). Full mechanism and alternatives considered: [ADR 0004](adr/0004-envelope-funding-via-sentinel-account.md); delete-behavior rationale: [ADR 0005](adr/0005-restrict-not-set-null-for-envelope-and-category.md).
 
 ### Schema
 
